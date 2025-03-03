@@ -306,10 +306,20 @@ int main() {
     json_decref(image_map);
     json_decref(root);
     
+    // Step 7: Clean up temporary directory
+    printf("Step 7: Cleaning up temporary files...\n");
+    char cleanup_cmd[256];
+    sprintf(cleanup_cmd, "rm -rf %s", TEMP_DIR);
+    if (!execute_command(cleanup_cmd)) {
+        fprintf(stderr, "Warning: Failed to remove temporary directory %s\n", TEMP_DIR);
+        // Continue execution despite cleanup failure
+    }
+    
     printf("\nProcessing complete:\n");
     printf("- Total images processed: %zu\n", processed);
     printf("- Output written to %s\n", OUTPUT_FILE);
     printf("- Format: [image_path]\\t[caption]\n");
+    printf("- Temporary files removed from %s\n", TEMP_DIR);
     printf("\nYou can now use this data to train your image synthesis model.\n");
     
     curl_global_cleanup();
