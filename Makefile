@@ -14,4 +14,4 @@ run: sigm.out
 	@time ./sigm.out
 
 clean:
-	rm -f *.out *.bin *.jpg
+	rm -f *.out *.bin
