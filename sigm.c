@@ -52,13 +52,12 @@ Image load_jpeg(const char *filename) {
     return img;
 }
 
-// Function to save a color image
-void save_color_image(const char *filename, unsigned char *data, int width, int height, int channels) {
+// Function to save a grayscale image
+void save_grayscale_image(const char *filename, unsigned char *data, int width, int height) {
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
     FILE *outfile;
     JSAMPARRAY buffer;
-    int row_stride = width * channels;
     
     if ((outfile = fopen(filename, "wb")) == NULL) {
         fprintf(stderr, "Can't open %s\n", filename);
@@ -71,23 +70,25 @@ void save_color_image(const char *filename, unsigned char *data, int width, int 
     
     cinfo.image_width = width;
     cinfo.image_height = height;
-    cinfo.input_components = channels;
-    cinfo.in_color_space = (channels == 3) ? JCS_RGB : JCS_GRAYSCALE;
+    cinfo.input_components = 1;
+    cinfo.in_color_space = JCS_GRAYSCALE;
     
     jpeg_set_defaults(&cinfo);
     jpeg_set_quality(&cinfo, 90, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
     
-    buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+    buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, width, 1);
     
     while (cinfo.next_scanline < cinfo.image_height) {
-        memcpy(buffer[0], data + cinfo.next_scanline * row_stride, row_stride);
+        memcpy(buffer[0], data + cinfo.next_scanline * width, width);
         jpeg_write_scanlines(&cinfo, buffer, 1);
     }
     
     jpeg_finish_compress(&cinfo);
     jpeg_destroy_compress(&cinfo);
     fclose(outfile);
+    
+    printf("Saved %s\n", filename);
 }
 
 // Function to shift Hartley transform
@@ -139,24 +140,16 @@ void apply_low_pass_filter(double *shifted, int width, int height, double cutoff
     }
 }
 
-// Function to save Hartley visualization
-void save_visualization(const char *filename, double **data, int width, int height, int is_filtered) {
+// Function to save visualization of Hartley transform
+void save_visualization(const char *filename, double *data, int width, int height, int is_filtered) {
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
     FILE *outfile;
     JSAMPARRAY buffer;
     
-    // Create a composite visualization using the magnitudes from all three channels
+    // Create a copy of the data for visualization
     double *vis_data = (double *)malloc(width * height * sizeof(double));
-    memset(vis_data, 0, width * height * sizeof(double));
-    
-    // Sum magnitudes from all channels
-    for (int i = 0; i < width * height; i++) {
-        for (int c = 0; c < 3; c++) {  // RGB channels
-            vis_data[i] += fabs(data[c][i]);
-        }
-        vis_data[i] /= 3.0;  // Average magnitude
-    }
+    memcpy(vis_data, data, width * height * sizeof(double));
     
     // For visualization, we'll use logarithmic scaling
     double min_val = vis_data[0];
@@ -166,9 +159,10 @@ void save_visualization(const char *filename, double **data, int width, int heig
         if (vis_data[i] > max_val) max_val = vis_data[i];
     }
     
-    // Apply log scaling: log(1 + |x|)
+    // Apply log scaling: log(1 + |x|), preserving signs
     for (int i = 0; i < width * height; i++) {
-        vis_data[i] = log(1.0 + fabs(vis_data[i]));
+        double sign = (vis_data[i] >= 0) ? 1.0 : -1.0;
+        vis_data[i] = sign * log(1.0 + fabs(vis_data[i]));
     }
     
     // Find new min/max after scaling
@@ -214,19 +208,19 @@ void save_visualization(const char *filename, double **data, int width, int heig
     fclose(outfile);
     free(vis_data);
     
-    printf("Saved %s (Hartley transform %s visualization)\n", 
+    printf("Saved %s (Hartley transform %s)\n", 
            filename, is_filtered ? "filtered" : "unfiltered");
 }
 
-// Function to compute the 2D Hartley Transform for a single channel
-double* compute_hartley_transform(unsigned char *channel_data, int width, int height) {
+// Function to compute the 2D Hartley Transform
+double* compute_hartley_transform(unsigned char *grayscale, int width, int height) {
     // Allocate memory for FFTW
     double *input = (double *)fftw_malloc(sizeof(double) * width * height);
     double *hartley = (double *)fftw_malloc(sizeof(double) * width * height);
     
-    // Copy channel data to double array for processing
+    // Copy grayscale image to double array for processing
     for (int i = 0; i < width * height; i++) {
-        input[i] = (double)channel_data[i];
+        input[i] = (double)grayscale[i];
     }
     
     // Use r2r (real-to-real) transform with DHT (discrete Hartley transform)
@@ -247,10 +241,11 @@ double* compute_hartley_transform(unsigned char *channel_data, int width, int he
     return hartley;
 }
 
-// Function to compute the inverse 2D Hartley Transform for a single channel
-void inverse_hartley_transform(double *hartley, unsigned char *channel_data, int width, int height) {
+// Function to compute the inverse 2D Hartley Transform
+unsigned char* inverse_hartley_transform(double *hartley, int width, int height) {
     // Allocate memory for FFTW
     double *output = (double *)fftw_malloc(sizeof(double) * width * height);
+    unsigned char *result = (unsigned char *)malloc(width * height);
     
     // Create FFTW plan for inverse DHT
     // DHT is its own inverse, just need to scale afterward
@@ -276,52 +271,45 @@ void inverse_hartley_transform(double *hartley, unsigned char *channel_data, int
         // Normalize to 0-255 range if needed
         if (max_val > 255 || min_val < 0) {
             double normalized = (output[i] * norm_factor - min_val) / (max_val - min_val);
-            channel_data[i] = (unsigned char)(normalized * 255.0);
+            result[i] = (unsigned char)(normalized * 255.0);
         } else {
             // Just clip values
             double val = output[i] * norm_factor;
             if (val < 0) val = 0;
             if (val > 255) val = 255;
-            channel_data[i] = (unsigned char)val;
+            result[i] = (unsigned char)val;
         }
     }
     
     // Clean up FFTW resources
     fftw_destroy_plan(plan);
     fftw_free(output);
+    
+    return result;
 }
 
-// Function to extract a single channel from an RGB image
-unsigned char* extract_channel(Image img, int channel_index) {
-    unsigned char *channel_data = (unsigned char *)malloc(img.width * img.height);
+// Convert color image to grayscale
+unsigned char* convert_to_grayscale(Image img) {
+    unsigned char *grayscale = (unsigned char *)malloc(img.width * img.height);
     
     for (int y = 0; y < img.height; y++) {
         for (int x = 0; x < img.width; x++) {
-            int src_idx = (y * img.width + x) * img.channels + channel_index;
-            int dst_idx = y * img.width + x;
-            channel_data[dst_idx] = img.data[src_idx];
-        }
-    }
-    
-    return channel_data;
-}
-
-// Function to combine color channels into an RGB image
-unsigned char* combine_channels(unsigned char *red, unsigned char *green, unsigned char *blue, int width, int height) {
-    unsigned char *rgb = (unsigned char *)malloc(width * height * 3);
-    
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int src_idx = y * width + x;
-            int dst_idx = (y * width + x) * 3;
+            int idx = (y * img.width + x) * img.channels;
             
-            rgb[dst_idx + 0] = red[src_idx];
-            rgb[dst_idx + 1] = green[src_idx];
-            rgb[dst_idx + 2] = blue[src_idx];
+            if (img.channels >= 3) {
+                // Standard luminance formula
+                grayscale[y * img.width + x] = (unsigned char)(
+                    0.299 * img.data[idx] +      // Red
+                    0.587 * img.data[idx + 1] +  // Green
+                    0.114 * img.data[idx + 2]);  // Blue
+            } else {
+                // Already grayscale
+                grayscale[y * img.width + x] = img.data[idx];
+            }
         }
     }
     
-    return rgb;
+    return grayscale;
 }
 
 int main() {
@@ -334,94 +322,47 @@ int main() {
     
     printf("Image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
     
-    // If image is grayscale, return error
-    if (img.channels < 3) {
-        fprintf(stderr, "This version expects a color image with at least 3 channels\n");
-        free(img.data);
-        return 1;
-    }
+    // Convert to grayscale
+    unsigned char *grayscale = convert_to_grayscale(img);
     
-    // Extract individual channels
-    unsigned char *red_channel = extract_channel(img, 0);
-    unsigned char *green_channel = extract_channel(img, 1);
-    unsigned char *blue_channel = extract_channel(img, 2);
+    // Save the grayscale image
+    save_grayscale_image("grayscale.jpg", grayscale, img.width, img.height);
     
-    // Compute the Hartley transform for each channel
-    double *hartley_red = compute_hartley_transform(red_channel, img.width, img.height);
-    double *hartley_green = compute_hartley_transform(green_channel, img.width, img.height);
-    double *hartley_blue = compute_hartley_transform(blue_channel, img.width, img.height);
+    // Compute the Hartley transform
+    double *hartley_data = compute_hartley_transform(grayscale, img.width, img.height);
     
-    // Create shifted versions for filtering
-    double *shifted_red = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
-    double *shifted_green = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
-    double *shifted_blue = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
+    // Create shifted version of the transform
+    double *shifted_data = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
+    hartley_shift(hartley_data, shifted_data, img.width, img.height);
     
-    hartley_shift(hartley_red, shifted_red, img.width, img.height);
-    hartley_shift(hartley_green, shifted_green, img.width, img.height);
-    hartley_shift(hartley_blue, shifted_blue, img.width, img.height);
+    // Save the shifted Hartley transform
+    save_visualization("hartley.jpg", shifted_data, img.width, img.height, 0);
     
-    // Save visualization of shifted (unfiltered) transforms
-    double *shifted_transforms[3] = {shifted_red, shifted_green, shifted_blue};
-    save_visualization("hartley.jpg", shifted_transforms, img.width, img.height, 0);
-    
-    // Apply low-pass filter to each channel
-    double radius = img.width * 0.00495;  // 20% of image width
+    // Apply low-pass filter (filter radius is 10% of the image width)
+    double radius = img.width * 0.1;
     printf("Applying low-pass filter with radius %.1f pixels\n", radius);
+    apply_low_pass_filter(shifted_data, img.width, img.height, radius);
     
-    apply_low_pass_filter(shifted_red, img.width, img.height, radius);
-    apply_low_pass_filter(shifted_green, img.width, img.height, radius);
-    apply_low_pass_filter(shifted_blue, img.width, img.height, radius);
+    // Save the filtered (still shifted) Hartley transform
+    save_visualization("hartley_filtered.jpg", shifted_data, img.width, img.height, 1);
     
-    // Save visualization of filtered transforms
-    save_visualization("hartley_filtered.jpg", shifted_transforms, img.width, img.height, 1);
+    // Inverse shift the filtered data back to original arrangement
+    double *filtered_hartley = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
+    hartley_ishift(shifted_data, filtered_hartley, img.width, img.height);
     
-    // Inverse shift the filtered data
-    double *filtered_red = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
-    double *filtered_green = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
-    double *filtered_blue = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
+    // Compute inverse Hartley transform to get filtered image
+    unsigned char *filtered_image = inverse_hartley_transform(filtered_hartley, img.width, img.height);
     
-    hartley_ishift(shifted_red, filtered_red, img.width, img.height);
-    hartley_ishift(shifted_green, filtered_green, img.width, img.height);
-    hartley_ishift(shifted_blue, filtered_blue, img.width, img.height);
-    
-    // Compute inverse Hartley transform for each channel
-    unsigned char *filtered_red_channel = (unsigned char *)malloc(img.width * img.height);
-    unsigned char *filtered_green_channel = (unsigned char *)malloc(img.width * img.height);
-    unsigned char *filtered_blue_channel = (unsigned char *)malloc(img.width * img.height);
-    
-    inverse_hartley_transform(filtered_red, filtered_red_channel, img.width, img.height);
-    inverse_hartley_transform(filtered_green, filtered_green_channel, img.width, img.height);
-    inverse_hartley_transform(filtered_blue, filtered_blue_channel, img.width, img.height);
-    
-    // Combine the filtered channels back into a color image
-    unsigned char *filtered_color = combine_channels(
-        filtered_red_channel, filtered_green_channel, filtered_blue_channel, 
-        img.width, img.height
-    );
-    
-    // Save the final filtered color image
-    save_color_image("img_filtered.jpg", filtered_color, img.width, img.height, 3);
-    printf("Filtered color image saved as 'img_filtered.jpg'\n");
+    // Save the filtered image
+    save_grayscale_image("img_filtered.jpg", filtered_image, img.width, img.height);
     
     // Clean up
     free(img.data);
-    free(red_channel);
-    free(green_channel);
-    free(blue_channel);
-    free(filtered_red_channel);
-    free(filtered_green_channel);
-    free(filtered_blue_channel);
-    free(filtered_color);
-    
-    fftw_free(hartley_red);
-    fftw_free(hartley_green);
-    fftw_free(hartley_blue);
-    fftw_free(shifted_red);
-    fftw_free(shifted_green);
-    fftw_free(shifted_blue);
-    fftw_free(filtered_red);
-    fftw_free(filtered_green);
-    fftw_free(filtered_blue);
+    free(grayscale);
+    free(filtered_image);
+    fftw_free(hartley_data);
+    fftw_free(shifted_data);
+    fftw_free(filtered_hartley);
     
     return 0;
 }
