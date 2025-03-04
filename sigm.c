@@ -119,21 +119,19 @@ void hartley_ishift(double *shifted, double *data, int width, int height) {
     }
 }
 
-// Function to apply low-pass filter to shifted Hartley transform
-void apply_low_pass_filter(double *shifted, int width, int height, double cutoff_radius) {
+// Function to apply square low-pass filter to shifted Hartley transform
+void apply_square_filter(double *shifted, int width, int height, int cutoff_size) {
     int center_x = width / 2;
     int center_y = height / 2;
-    double radius_squared = cutoff_radius * cutoff_radius;
     
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            // Calculate distance from center (squared)
-            double dx = x - center_x;
-            double dy = y - center_y;
-            double distance_squared = dx*dx + dy*dy;
+            // Calculate distance from center (maximum of x and y components)
+            int dx = abs(x - center_x);
+            int dy = abs(y - center_y);
             
-            // Apply filter (hard cutoff)
-            if (distance_squared > radius_squared) {
+            // Apply square filter - keep only frequencies within square centered at DC
+            if (dx > cutoff_size || dy > cutoff_size) {
                 shifted[y * width + x] = 0.0;
             }
         }
@@ -338,10 +336,10 @@ int main() {
     // Save the shifted Hartley transform
     save_visualization("hartley.jpg", shifted_data, img.width, img.height, 0);
     
-    // Apply low-pass filter (filter radius is 10% of the image width)
-    double radius = img.width * 0.1;
-    printf("Applying low-pass filter with radius %.1f pixels\n", radius);
-    apply_low_pass_filter(shifted_data, img.width, img.height, radius);
+    // Apply square low-pass filter (filter size is 25% of the image width)
+    int cutoff_size = img.width * 0.25;
+    printf("Applying square low-pass filter with half-width %d pixels\n", cutoff_size);
+    apply_square_filter(shifted_data, img.width, img.height, cutoff_size);
     
     // Save the filtered (still shifted) Hartley transform
     save_visualization("hartley_filtered.jpg", shifted_data, img.width, img.height, 1);
