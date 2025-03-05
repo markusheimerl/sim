@@ -3,7 +3,6 @@
 #include <string.h>
 #include <math.h>
 #include <jpeglib.h>
-#include <fftw3.h>
 #include <time.h>
 
 typedef struct {
@@ -92,40 +91,93 @@ void save_grayscale_image(const char *filename, unsigned char *data, int width, 
     printf("Saved %s\n", filename);
 }
 
-// Function to shift Hartley transform
-void hartley_shift(double *data, double *shifted, int width, int height) {
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            // Calculate destination coordinates after shift
-            int dst_y = (y + height/2) % height;
-            int dst_x = (x + width/2) % width;
+// Function to save a 1D array as a multi-row JPEG to handle dimension limits
+void save_1d_as_jpeg(const char *filename, unsigned char *data, int length) {
+    // JPEG has limitations on max dimension, so arrange in multiple rows if needed
+    // Maximum width for JPEG is usually around 65,000 pixels
+    const int MAX_WIDTH = 4096;  // Use a more reasonable limit
+    
+    int width, height;
+    if (length <= MAX_WIDTH) {
+        width = length;
+        height = 1;
+    } else {
+        width = MAX_WIDTH;
+        height = (length + MAX_WIDTH - 1) / MAX_WIDTH;  // Ceiling division
+    }
+    
+    // Create a 2D array from our 1D data
+    unsigned char *img_data = (unsigned char *)malloc(width * height);
+    memset(img_data, 0, width * height);  // Initialize to 0
+    
+    // Copy the data
+    for (int i = 0; i < length; i++) {
+        int row = i / width;
+        int col = i % width;
+        img_data[row * width + col] = data[i];
+    }
+    
+    // Save as JPEG
+    save_grayscale_image(filename, img_data, width, height);
+    free(img_data);
+    
+    printf("Saved 1D data as JPEG: %s (%d×%d)\n", filename, width, height);
+}
+
+// Scale an image to a new size using nearest neighbor interpolation
+Image scale_image(Image src, int new_width, int new_height) {
+    Image dst = {0};
+    dst.width = new_width;
+    dst.height = new_height;
+    dst.channels = src.channels;
+    dst.data = (unsigned char *)malloc(new_width * new_height * src.channels);
+    
+    double x_ratio = (double)src.width / new_width;
+    double y_ratio = (double)src.height / new_height;
+    
+    for (int y = 0; y < new_height; y++) {
+        for (int x = 0; x < new_width; x++) {
+            int src_x = (int)(x * x_ratio);
+            int src_y = (int)(y * y_ratio);
             
-            // Copy data with shift
-            shifted[dst_y * width + dst_x] = data[y * width + x];
+            // Clamp to image bounds
+            if (src_x >= src.width) src_x = src.width - 1;
+            if (src_y >= src.height) src_y = src.height - 1;
+            
+            for (int c = 0; c < src.channels; c++) {
+                int src_idx = (src_y * src.width + src_x) * src.channels + c;
+                int dst_idx = (y * new_width + x) * src.channels + c;
+                dst.data[dst_idx] = src.data[src_idx];
+            }
         }
+    }
+    
+    printf("Scaled image from %d×%d to %d×%d\n", src.width, src.height, new_width, new_height);
+    return dst;
+}
+
+// Calculate scaling factors to resize an image to a maximum dimension
+void calculate_scaling_factors(int width, int height, int max_dim, int *new_width, int *new_height) {
+    if (width <= max_dim && height <= max_dim) {
+        // Image is already small enough
+        *new_width = width;
+        *new_height = height;
+    } else if (width > height) {
+        // Width is the larger dimension
+        *new_width = max_dim;
+        *new_height = (int)(height * ((double)max_dim / width));
+    } else {
+        // Height is the larger dimension
+        *new_height = max_dim;
+        *new_width = (int)(width * ((double)max_dim / height));
     }
 }
 
-// Function to inverse shift Hartley transform
-void hartley_ishift(double *shifted, double *data, int width, int height) {
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            // Calculate source coordinates before shift
-            int src_y = (y + height/2) % height;
-            int src_x = (x + width/2) % width;
-            
-            // Copy data with inverse shift
-            data[y * width + x] = shifted[src_y * width + src_x];
-        }
-    }
-}
-
-// Function to add Gaussian noise to the Hartley transform
-void add_gaussian_noise(double *data, int width, int height, double noise_level) {
-    // Box-Muller transform for generating Gaussian random numbers
+// Function to add Gaussian noise to a 1D array
+void add_gaussian_noise(unsigned char *data, int length, double noise_level) {
     double noise_stddev = noise_level * 255.0; // Scale the noise level
     
-    for (int i = 0; i < width * height; i++) {
+    for (int i = 0; i < length; i++) {
         double u1 = (double)rand() / RAND_MAX;
         double u2 = (double)rand() / RAND_MAX;
         
@@ -135,157 +187,44 @@ void add_gaussian_noise(double *data, int width, int height, double noise_level)
         // Box-Muller transform
         double z0 = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
         
-        // Add noise
-        data[i] += z0 * noise_stddev;
+        // Add noise and clip to valid range
+        int pixel_value = (int)data[i] + (int)(z0 * noise_stddev);
+        if (pixel_value < 0) pixel_value = 0;
+        if (pixel_value > 255) pixel_value = 255;
+        data[i] = (unsigned char)pixel_value;
     }
 }
 
-// Function to save visualization of Hartley transform
-void save_visualization(const char *filename, double *data, int width, int height, int is_noisy) {
-    struct jpeg_compress_struct cinfo;
-    struct jpeg_error_mgr jerr;
-    FILE *outfile;
-    JSAMPARRAY buffer;
+// Extract center square from an image
+Image extract_center_square(Image img) {
+    Image square = {0};
     
-    // Create a copy of the data for visualization
-    double *vis_data = (double *)malloc(width * height * sizeof(double));
-    memcpy(vis_data, data, width * height * sizeof(double));
+    // Determine the size of the square (minimum of width and height)
+    int size = (img.width < img.height) ? img.width : img.height;
     
-    // For visualization, we'll use logarithmic scaling
-    double min_val = vis_data[0];
-    double max_val = vis_data[0];
-    for (int i = 1; i < width * height; i++) {
-        if (vis_data[i] < min_val) min_val = vis_data[i];
-        if (vis_data[i] > max_val) max_val = vis_data[i];
-    }
+    // Calculate top-left corner of the square
+    int start_x = (img.width - size) / 2;
+    int start_y = (img.height - size) / 2;
     
-    // Apply log scaling: log(1 + |x|), preserving signs
-    for (int i = 0; i < width * height; i++) {
-        double sign = (vis_data[i] >= 0) ? 1.0 : -1.0;
-        vis_data[i] = sign * log(1.0 + fabs(vis_data[i]));
-    }
+    // Create the square image
+    square.width = size;
+    square.height = size;
+    square.channels = img.channels;
+    square.data = (unsigned char *)malloc(size * size * img.channels);
     
-    // Find new min/max after scaling
-    min_val = vis_data[0];
-    max_val = vis_data[0];
-    for (int i = 1; i < width * height; i++) {
-        if (vis_data[i] < min_val) min_val = vis_data[i];
-        if (vis_data[i] > max_val) max_val = vis_data[i];
-    }
-    
-    if ((outfile = fopen(filename, "wb")) == NULL) {
-        fprintf(stderr, "Can't open %s\n", filename);
-        free(vis_data);
-        return;
-    }
-    
-    cinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_compress(&cinfo);
-    jpeg_stdio_dest(&cinfo, outfile);
-    
-    cinfo.image_width = width;
-    cinfo.image_height = height;
-    cinfo.input_components = 1;
-    cinfo.in_color_space = JCS_GRAYSCALE;
-    
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, 90, TRUE);
-    jpeg_start_compress(&cinfo, TRUE);
-    
-    buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, width, 1);
-    
-    while (cinfo.next_scanline < cinfo.image_height) {
-        for (int i = 0; i < width; i++) {
-            // Normalize to 0-255 range
-            double normalized = (vis_data[cinfo.next_scanline * width + i] - min_val) / (max_val - min_val);
-            buffer[0][i] = (JSAMPLE)(normalized * 255.0);
-        }
-        jpeg_write_scanlines(&cinfo, buffer, 1);
-    }
-    
-    jpeg_finish_compress(&cinfo);
-    jpeg_destroy_compress(&cinfo);
-    fclose(outfile);
-    free(vis_data);
-    
-    printf("Saved %s (Hartley transform %s)\n", 
-           filename, is_noisy ? "with noise" : "original");
-}
-
-// Function to compute the 2D Hartley Transform
-double* compute_hartley_transform(unsigned char *grayscale, int width, int height) {
-    // Allocate memory for FFTW
-    double *input = (double *)fftw_malloc(sizeof(double) * width * height);
-    double *hartley = (double *)fftw_malloc(sizeof(double) * width * height);
-    
-    // Copy grayscale image to double array for processing
-    for (int i = 0; i < width * height; i++) {
-        input[i] = (double)grayscale[i];
-    }
-    
-    // Use r2r (real-to-real) transform with DHT (discrete Hartley transform)
-    fftw_plan plan = fftw_plan_r2r_2d(height, width, input, hartley, FFTW_DHT, FFTW_DHT, FFTW_ESTIMATE);
-    fftw_execute(plan);
-    
-    // FFTW computes an unnormalized transform, so normalize by sqrt(N)
-    double norm_factor = 1.0 / sqrt(width * height);
-    for (int i = 0; i < width * height; i++) {
-        hartley[i] *= norm_factor;
-    }
-    
-    // Clean up FFTW resources
-    fftw_destroy_plan(plan);
-    fftw_free(input);
-    
-    // Return the result
-    return hartley;
-}
-
-// Function to compute the inverse 2D Hartley Transform
-unsigned char* inverse_hartley_transform(double *hartley, int width, int height) {
-    // Allocate memory for FFTW
-    double *output = (double *)fftw_malloc(sizeof(double) * width * height);
-    unsigned char *result = (unsigned char *)malloc(width * height);
-    
-    // Create FFTW plan for inverse DHT
-    // DHT is its own inverse, just need to scale afterward
-    fftw_plan plan = fftw_plan_r2r_2d(height, width, hartley, output, FFTW_DHT, FFTW_DHT, FFTW_ESTIMATE);
-    fftw_execute(plan);
-    
-    // Normalize by 1/N for inverse transform
-    double norm_factor = 1.0 / (width * height);
-    
-    // Convert back to unsigned char with proper scaling
-    double min_val = output[0] * norm_factor;
-    double max_val = min_val;
-    
-    // Find min/max values
-    for (int i = 1; i < width * height; i++) {
-        double val = output[i] * norm_factor;
-        if (val < min_val) min_val = val;
-        if (val > max_val) max_val = val;
-    }
-    
-    // Scale and convert to unsigned char
-    for (int i = 0; i < width * height; i++) {
-        // Normalize to 0-255 range if needed
-        if (max_val > 255 || min_val < 0) {
-            double normalized = (output[i] * norm_factor - min_val) / (max_val - min_val);
-            result[i] = (unsigned char)(normalized * 255.0);
-        } else {
-            // Just clip values
-            double val = output[i] * norm_factor;
-            if (val < 0) val = 0;
-            if (val > 255) val = 255;
-            result[i] = (unsigned char)val;
+    // Copy the center square from the original image
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            for (int c = 0; c < img.channels; c++) {
+                int src_idx = ((start_y + y) * img.width + (start_x + x)) * img.channels + c;
+                int dst_idx = (y * size + x) * img.channels + c;
+                square.data[dst_idx] = img.data[src_idx];
+            }
         }
     }
     
-    // Clean up FFTW resources
-    fftw_destroy_plan(plan);
-    fftw_free(output);
-    
-    return result;
+    printf("Extracted center square: %d x %d\n", size, size);
+    return square;
 }
 
 // Convert color image to grayscale
@@ -312,53 +251,130 @@ unsigned char* convert_to_grayscale(Image img) {
     return grayscale;
 }
 
-// Scale an image to a new size
-Image scale_image(Image src, int new_width, int new_height) {
-    Image dst = {0};
-    dst.width = new_width;
-    dst.height = new_height;
-    dst.channels = src.channels;
-    dst.data = (unsigned char *)malloc(new_width * new_height * src.channels);
+// Rotate/flip a quadrant appropriately for Hilbert curve
+void rotate(int n, int *x, int *y, int rx, int ry) {
+    if (ry == 0) {
+        if (rx == 1) {
+            *x = n-1 - *x;
+            *y = n-1 - *y;
+        }
+        // Swap x and y
+        int t = *x;
+        *x = *y;
+        *y = t;
+    }
+}
+
+// Convert (x,y) to d (distance along Hilbert curve)
+int xy2d(int n, int x, int y) {
+    int rx, ry, s, d=0;
+    for (s=n/2; s>0; s/=2) {
+        rx = (x & s) > 0;
+        ry = (y & s) > 0;
+        d += s * s * ((3 * rx) ^ ry);
+        rotate(s, &x, &y, rx, ry);
+    }
+    return d;
+}
+
+// Convert d (distance along Hilbert curve) to (x,y)
+void d2xy(int n, int d, int *x, int *y) {
+    int rx, ry, s, t=d;
+    *x = *y = 0;
+    for (s=1; s<n; s*=2) {
+        rx = 1 & (t/2);
+        ry = 1 & (t ^ rx);
+        rotate(s, x, y, rx, ry);
+        *x += s * rx;
+        *y += s * ry;
+        t /= 4;
+    }
+}
+
+// Find the next power of 2
+int next_power_of_2(int n) {
+    int power = 1;
+    while (power < n) power *= 2;
+    return power;
+}
+
+// Structure to hold 2D coordinates and Hilbert indices
+typedef struct {
+    int x, y;      // 2D coordinates
+    int hilbert_d; // Hilbert distance
+} HilbertPoint;
+
+// Comparison function for qsort
+int compare_hilbert(const void *a, const void *b) {
+    return ((HilbertPoint*)a)->hilbert_d - ((HilbertPoint*)b)->hilbert_d;
+}
+
+// Create a mapping from 2D to 1D using Hilbert curve ordering
+void create_hilbert_mapping(int width, int height, int **to_1d, int **to_2d) {
+    // Determine n (power of 2 >= max(width, height))
+    int n = next_power_of_2((width > height) ? width : height);
     
-    // Simple nearest neighbor scaling - faster but less quality
-    // Could be replaced with better algorithms like bilinear or bicubic
-    double x_ratio = (double)src.width / new_width;
-    double y_ratio = (double)src.height / new_height;
+    // Allocate memory for map arrays
+    *to_1d = (int*)malloc(width * height * sizeof(int));
+    *to_2d = (int*)malloc(width * height * sizeof(int));
     
-    for (int y = 0; y < new_height; y++) {
-        for (int x = 0; x < new_width; x++) {
-            int src_x = (int)(x * x_ratio);
-            int src_y = (int)(y * y_ratio);
-            
-            if (src_x >= src.width) src_x = src.width - 1;
-            if (src_y >= src.height) src_y = src.height - 1;
-            
-            for (int c = 0; c < src.channels; c++) {
-                int src_idx = (src_y * src.width + src_x) * src.channels + c;
-                int dst_idx = (y * new_width + x) * src.channels + c;
-                dst.data[dst_idx] = src.data[src_idx];
-            }
+    // Create array of points with their Hilbert distances
+    HilbertPoint *points = (HilbertPoint*)malloc(width * height * sizeof(HilbertPoint));
+    int idx = 0;
+    
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            points[idx].x = x;
+            points[idx].y = y;
+            points[idx].hilbert_d = xy2d(n, x, y);
+            idx++;
         }
     }
     
-    return dst;
+    // Sort points by Hilbert distance
+    qsort(points, width * height, sizeof(HilbertPoint), compare_hilbert);
+    
+    // Fill in the mapping arrays
+    for (int i = 0; i < width * height; i++) {
+        int orig_idx = points[i].y * width + points[i].x;
+        (*to_1d)[orig_idx] = i;  // Maps from 2D to 1D
+        (*to_2d)[i] = orig_idx;  // Maps from 1D to 2D
+    }
+    
+    free(points);
 }
 
-// Calculate scaling factors to resize an image to a maximum dimension
-void calculate_scaling_factors(int width, int height, int max_dim, int *new_width, int *new_height) {
-    if (width <= max_dim && height <= max_dim) {
-        // Image is already small enough
-        *new_width = width;
-        *new_height = height;
-    } else if (width > height) {
-        // Width is the larger dimension
-        *new_width = max_dim;
-        *new_height = (int)(height * ((double)max_dim / width));
-    } else {
-        // Height is the larger dimension
-        *new_height = max_dim;
-        *new_width = (int)(width * ((double)max_dim / height));
+// Flatten a grayscale image using Hilbert curve ordering
+unsigned char* flatten_with_hilbert(unsigned char *grayscale, int width, int height, int **to_2d) {
+    // Create forward and backward mappings
+    int *to_1d;
+    create_hilbert_mapping(width, height, &to_1d, to_2d);
+    
+    // Create the flattened array
+    unsigned char *flattened = (unsigned char*)malloc(width * height);
+    
+    // Flatten using the mapping
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int orig_idx = y * width + x;
+            int flat_idx = to_1d[orig_idx];
+            flattened[flat_idx] = grayscale[orig_idx];
+        }
     }
+    
+    free(to_1d);
+    return flattened;
+}
+
+// Unflatten a 1D array back to a 2D image
+unsigned char* unflatten_with_hilbert(unsigned char *flattened, int width, int height, int *to_2d) {
+    unsigned char *unflattened = (unsigned char*)malloc(width * height);
+    
+    for (int i = 0; i < width * height; i++) {
+        unflattened[to_2d[i]] = flattened[i];
+    }
+    
+    return unflattened;
 }
 
 int main() {
@@ -376,62 +392,57 @@ int main() {
     
     printf("Original image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
     
-    // Scale down the image if it's too big (max dimension of 128 pixels)
-    int max_dimension = 128;
+    // Step 1: Scale down the image to a maximum dimension
+    int max_dimension = 128; // Maximum dimension for processing
     int new_width, new_height;
     calculate_scaling_factors(img.width, img.height, max_dimension, &new_width, &new_height);
     
     Image scaled_img;
     if (new_width != img.width || new_height != img.height) {
-        printf("Scaling image to %d x %d\n", new_width, new_height);
         scaled_img = scale_image(img, new_width, new_height);
-        free(img.data);  // Free original image after scaling
+        free(img.data); // Free the original image data
     } else {
         printf("No scaling needed, dimensions already appropriate\n");
-        scaled_img = img;  // Use original image
+        scaled_img = img; // Just use the original
     }
     
-    // Convert to grayscale
-    unsigned char *grayscale = convert_to_grayscale(scaled_img);
+    // Step 2: Extract center square from the scaled image
+    Image square_img = extract_center_square(scaled_img);
+    free(scaled_img.data); // Free the scaled image data
+    
+    // Step 3: Convert to grayscale
+    unsigned char *grayscale = convert_to_grayscale(square_img);
     
     // Save the grayscale image
-    save_grayscale_image("grayscale.jpg", grayscale, scaled_img.width, scaled_img.height);
+    save_grayscale_image("grayscale.jpg", grayscale, square_img.width, square_img.height);
     
-    // Compute the Hartley transform
-    double *hartley_data = compute_hartley_transform(grayscale, scaled_img.width, scaled_img.height);
+    // Step 4: Create Hilbert mapping and flatten the image
+    int *to_2d;
+    unsigned char *flattened = flatten_with_hilbert(grayscale, square_img.width, square_img.height, &to_2d);
     
-    // Create shifted version of the transform
-    double *shifted_data = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
-    hartley_shift(hartley_data, shifted_data, scaled_img.width, scaled_img.height);
+    // Save the flattened data as JPEG
+    save_1d_as_jpeg("flattened.jpg", flattened, square_img.width * square_img.height);
     
-    // Save the shifted Hartley transform (original)
-    save_visualization("hartley.jpg", shifted_data, scaled_img.width, scaled_img.height, 0);
+    // Step 5: Add Gaussian noise to the flattened 1D array
+    double noise_level = 0.05; // Adjust this to control noise intensity (0.0 to 1.0)
+    printf("Adding Gaussian noise with level %.2f to the flattened array\n", noise_level);
+    add_gaussian_noise(flattened, square_img.width * square_img.height, noise_level);
     
-    // Add Gaussian noise to the Hartley transform
-    double noise_level = 0.3; // Adjust this to control noise intensity (0.0 to 1.0)
-    printf("Adding Gaussian noise with level %.2f\n", noise_level);
-    add_gaussian_noise(shifted_data, scaled_img.width, scaled_img.height, noise_level);
+    // Save the noisy flattened data
+    save_1d_as_jpeg("flattened_noisy.jpg", flattened, square_img.width * square_img.height);
     
-    // Save the noisy (still shifted) Hartley transform
-    save_visualization("hartley_noisy.jpg", shifted_data, scaled_img.width, scaled_img.height, 1);
-    
-    // Inverse shift the noisy data back to original arrangement
-    double *noisy_hartley = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
-    hartley_ishift(shifted_data, noisy_hartley, scaled_img.width, scaled_img.height);
-    
-    // Compute inverse Hartley transform to get noisy image
-    unsigned char *noisy_image = inverse_hartley_transform(noisy_hartley, scaled_img.width, scaled_img.height);
+    // Step 6: Unflatten the noisy data back to 2D
+    unsigned char *noisy_image = unflatten_with_hilbert(flattened, square_img.width, square_img.height, to_2d);
     
     // Save the noisy image
-    save_grayscale_image("img_noisy.jpg", noisy_image, scaled_img.width, scaled_img.height);
+    save_grayscale_image("img_noisy.jpg", noisy_image, square_img.width, square_img.height);
     
     // Clean up
-    free(scaled_img.data);
+    free(square_img.data);
     free(grayscale);
+    free(flattened);
     free(noisy_image);
-    fftw_free(hartley_data);
-    fftw_free(shifted_data);
-    fftw_free(noisy_hartley);
+    free(to_2d);
     
     return 0;
 }
