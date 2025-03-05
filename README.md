@@ -1,2 +1,2 @@
 # sigm
-A small image generation model
+A small image generation model implementation
