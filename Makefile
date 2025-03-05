@@ -34,4 +34,4 @@ gen: generate.out
 		$(shell ls -t *_layer4.bin | head -1)
 
 clean:
-	rm -f *.out *.bin
+	rm -f *.out *.bin *.jpg
