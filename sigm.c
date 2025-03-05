@@ -4,6 +4,7 @@
 #include <math.h>
 #include <jpeglib.h>
 #include <time.h>
+#include <dirent.h>
 
 typedef struct {
     unsigned char *data;
@@ -91,39 +92,6 @@ void save_grayscale_image(const char *filename, unsigned char *data, int width, 
     printf("Saved %s\n", filename);
 }
 
-// Function to save a 1D array as a multi-row JPEG to handle dimension limits
-void save_1d_as_jpeg(const char *filename, unsigned char *data, int length) {
-    // JPEG has limitations on max dimension, so arrange in multiple rows if needed
-    // Maximum width for JPEG is usually around 65,000 pixels
-    const int MAX_WIDTH = 4096;  // Use a more reasonable limit
-    
-    int width, height;
-    if (length <= MAX_WIDTH) {
-        width = length;
-        height = 1;
-    } else {
-        width = MAX_WIDTH;
-        height = (length + MAX_WIDTH - 1) / MAX_WIDTH;  // Ceiling division
-    }
-    
-    // Create a 2D array from our 1D data
-    unsigned char *img_data = (unsigned char *)malloc(width * height);
-    memset(img_data, 0, width * height);  // Initialize to 0
-    
-    // Copy the data
-    for (int i = 0; i < length; i++) {
-        int row = i / width;
-        int col = i % width;
-        img_data[row * width + col] = data[i];
-    }
-    
-    // Save as JPEG
-    save_grayscale_image(filename, img_data, width, height);
-    free(img_data);
-    
-    printf("Saved 1D data as JPEG: %s (%d×%d)\n", filename, width, height);
-}
-
 // Scale an image to a new size using nearest neighbor interpolation
 Image scale_image(Image src, int new_width, int new_height) {
     Image dst = {0};
@@ -152,7 +120,6 @@ Image scale_image(Image src, int new_width, int new_height) {
         }
     }
     
-    printf("Scaled image from %d×%d to %d×%d\n", src.width, src.height, new_width, new_height);
     return dst;
 }
 
@@ -236,7 +203,6 @@ Image extract_center_square(Image img) {
         }
     }
     
-    printf("Extracted center square: %d x %d\n", size, size);
     return square;
 }
 
@@ -288,20 +254,6 @@ int xy2d(int n, int x, int y) {
         rotate(s, &x, &y, rx, ry);
     }
     return d;
-}
-
-// Convert d (distance along Hilbert curve) to (x,y)
-void d2xy(int n, int d, int *x, int *y) {
-    int rx, ry, s, t=d;
-    *x = *y = 0;
-    for (s=1; s<n; s*=2) {
-        rx = 1 & (t/2);
-        ry = 1 & (t ^ rx);
-        rotate(s, x, y, rx, ry);
-        *x += s * rx;
-        *y += s * ry;
-        t /= 4;
-    }
 }
 
 // Find the next power of 2
@@ -402,24 +354,26 @@ void write_float_array_to_csv(FILE *fp, float *array, int length) {
     fprintf(fp, "\n");
 }
 
-int main() {
-    // Seed the random number generator
-    srand(time(NULL));
-    
-    const char *input_file = "img.jpg";
-    const int NUM_NOISE_STEPS = 1024;
+// Check if a file has a specific extension
+int has_extension(const char *filename, const char *ext) {
+    const char *dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return 0;
+    return strcasecmp(dot + 1, ext) == 0;
+}
+
+// Process a single image and add its noise sequences to the CSV file
+// Returns 1 if successful, 0 otherwise
+int process_image(const char *filepath, FILE *csv_file, int max_dimension, 
+                 int num_noise_steps, int is_first_image, int *square_size) {
     
     // Load the image
-    Image img = load_jpeg(input_file);
+    Image img = load_jpeg(filepath);
     if (img.data == NULL) {
-        fprintf(stderr, "Failed to load image: %s\n", input_file);
-        return 1;
+        fprintf(stderr, "Failed to load image: %s\n", filepath);
+        return 0;
     }
     
-    printf("Original image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
-    
-    // Step 1: Scale down the image to a maximum dimension
-    int max_dimension = 128; // Use 128 as requested
+    // Step 1: Scale down the image
     int new_width, new_height;
     calculate_scaling_factors(img.width, img.height, max_dimension, &new_width, &new_height);
     
@@ -428,7 +382,6 @@ int main() {
         scaled_img = scale_image(img, new_width, new_height);
         free(img.data); // Free the original image data
     } else {
-        printf("No scaling needed, dimensions already appropriate\n");
         scaled_img = img; // Just use the original
     }
     
@@ -436,11 +389,11 @@ int main() {
     Image square_img = extract_center_square(scaled_img);
     free(scaled_img.data); // Free the scaled image data
     
+    // Return the square size for the caller
+    *square_size = square_img.width;
+    
     // Step 3: Convert to grayscale
     unsigned char *grayscale = convert_to_grayscale(square_img);
-    
-    // Save the grayscale image
-    save_grayscale_image("grayscale.jpg", grayscale, square_img.width, square_img.height);
     
     // Step 4: Create Hilbert mapping and flatten the image
     int *to_2d;
@@ -449,45 +402,42 @@ int main() {
     // Get the length of the flattened array
     int flattened_length = square_img.width * square_img.height;
     
-    // Create a CSV file for the dataset
-    char csv_filename[256];
-    sprintf(csv_filename, "denoising_dataset_%dx%d.csv", square_img.width, square_img.height);
-    FILE *csv_file = fopen(csv_filename, "w");
-    if (!csv_file) {
-        fprintf(stderr, "Failed to create CSV file %s\n", csv_filename);
-        return 1;
-    }
-    
     // Allocate an array to hold all the noisy versions
-    float **noisy_arrays = (float**)malloc(NUM_NOISE_STEPS * sizeof(float*));
+    float **noisy_arrays = (float**)malloc(num_noise_steps * sizeof(float*));
     
     // Create a pure noise image for the most noisy step
     float *pure_noise = (float*)malloc(flattened_length * sizeof(float));
     generate_pure_noise(pure_noise, flattened_length);
     
     // Create increasingly noisy versions of the image
-    printf("Generating %d noise steps...\n", NUM_NOISE_STEPS);
+    printf("Generating %d noise steps for %s...\n", num_noise_steps, filepath);
     
-    // For visualization, save a few stages
-    int vis_steps[] = {0, 1, 4, 16, 64, 256, 512, 768, 1022, 1023};
-    int num_vis_steps = sizeof(vis_steps) / sizeof(vis_steps[0]);
+    // For the first image only, save visualization of noise stages
+    int *vis_steps = NULL;
+    int num_vis_steps = 0;
     
-    for (int i = 0; i < NUM_NOISE_STEPS; i++) {
+    if (is_first_image) {
+        // Define visualization steps for the first image only
+        int steps[] = {0, 1, 4, 16, 64, 256, 512, 768, 1022, 1023};
+        num_vis_steps = sizeof(steps) / sizeof(steps[0]);
+        vis_steps = malloc(num_vis_steps * sizeof(int));
+        memcpy(vis_steps, steps, num_vis_steps * sizeof(int));
+    }
+    
+    for (int i = 0; i < num_noise_steps; i++) {
         // Allocate memory for this noise step
         noisy_arrays[i] = (float*)malloc(flattened_length * sizeof(float));
         
         // Calculate the blend factor (0 = clean image, 1 = pure noise)
-        // Use a more aggressive curve to ensure the highest noise step is almost pure noise
-        float blend_factor = (float)i / (NUM_NOISE_STEPS - 1);
+        float blend_factor = (float)i / (num_noise_steps - 1);
         
         // Apply a power curve to make higher noise levels even more noisy
-        // The exponent 0.5 creates a curve that gets to high noise levels faster
         blend_factor = powf(blend_factor, 0.5f);
         
         // For the last few steps, ensure we reach pure noise
-        if (i >= NUM_NOISE_STEPS - 5) {
+        if (i >= num_noise_steps - 5) {
             // Blend quickly to pure noise in the last 5 steps
-            float last_steps_factor = (float)(i - (NUM_NOISE_STEPS - 5)) / 4.0f;
+            float last_steps_factor = (float)(i - (num_noise_steps - 5)) / 4.0f;
             blend_factor = blend_factor * (1.0f - last_steps_factor) + last_steps_factor;
         }
         
@@ -499,50 +449,42 @@ int main() {
         add_gaussian_noise_float(noisy_arrays[i], flattened_length, noise_level);
         
         // Make the final step pure noise
-        if (i == NUM_NOISE_STEPS - 1) {
+        if (i == num_noise_steps - 1) {
             memcpy(noisy_arrays[i], pure_noise, flattened_length * sizeof(float));
         }
         
-        // Visualize select noise levels
-        for (int v = 0; v < num_vis_steps; v++) {
-            if (i == vis_steps[v]) {
-                // Convert back to image and save for visualization
-                unsigned char *noisy_image = unflatten_with_hilbert(noisy_arrays[i], 
-                                                                   square_img.width, square_img.height, to_2d);
-                char vis_filename[256];
-                sprintf(vis_filename, "noisy_%d_of_%d.jpg", i, NUM_NOISE_STEPS-1);
-                save_grayscale_image(vis_filename, noisy_image, square_img.width, square_img.height);
-                free(noisy_image);
-                
-                printf("Saved visualization for noise step %d (blend factor: %.4f)\n", 
-                       i, blend_factor);
+        // For the first image only, visualize select noise levels
+        if (is_first_image && vis_steps != NULL) {
+            for (int v = 0; v < num_vis_steps; v++) {
+                if (i == vis_steps[v]) {
+                    // Convert back to image and save for visualization
+                    unsigned char *noisy_image = unflatten_with_hilbert(noisy_arrays[i], 
+                                                                       square_img.width, square_img.height, to_2d);
+                    char vis_filename[256];
+                    sprintf(vis_filename, "noisy_%d_of_%d.jpg", i, num_noise_steps-1);
+                    save_grayscale_image(vis_filename, noisy_image, square_img.width, square_img.height);
+                    free(noisy_image);
+                    
+                    printf("Saved visualization for noise step %d (blend factor: %.4f)\n", 
+                           i, blend_factor);
+                }
             }
         }
         
-        // Show progress
-        if (i % 100 == 0 || i == NUM_NOISE_STEPS - 1) {
-            printf("Generated noise step %d/%d (blend factor: %.4f)\n", 
-                   i+1, NUM_NOISE_STEPS, blend_factor);
+        // Show progress sparingly to avoid console spam
+        if (i == 0 || i == num_noise_steps-1 || i % (num_noise_steps/10) == 0) {
+            printf("  Generated noise step %d/%d (blend factor: %.4f)\n", 
+                   i+1, num_noise_steps, blend_factor);
         }
     }
     
-    // Write the CSV file in reverse order (from most noisy to clean)
-    printf("Writing CSV file with %d rows...\n", NUM_NOISE_STEPS);
-    for (int i = NUM_NOISE_STEPS - 1; i >= 0; i--) {
+    // Write all noise steps to the CSV file in reverse order (most noisy to clean)
+    for (int i = num_noise_steps - 1; i >= 0; i--) {
         write_float_array_to_csv(csv_file, noisy_arrays[i], flattened_length);
-        
-        // Show progress
-        if (i % 100 == 0 || i == 0) {
-            printf("Wrote row %d/%d to CSV\n", NUM_NOISE_STEPS - i, NUM_NOISE_STEPS);
-        }
     }
-    
-    // Close the CSV file
-    fclose(csv_file);
-    printf("CSV dataset created: %s\n", csv_filename);
     
     // Clean up all noisy arrays
-    for (int i = 0; i < NUM_NOISE_STEPS; i++) {
+    for (int i = 0; i < num_noise_steps; i++) {
         free(noisy_arrays[i]);
     }
     free(noisy_arrays);
@@ -553,6 +495,93 @@ int main() {
     free(grayscale);
     free(clean_flattened);
     free(to_2d);
+    
+    // Free visualization steps array if it was allocated
+    if (vis_steps) {
+        free(vis_steps);
+    }
+    
+    return 1;
+}
+
+int main() {
+    // Seed the random number generator
+    srand(time(NULL));
+    
+    const char *image_dir = "coco_images";
+    const int NUM_NOISE_STEPS = 1024;
+    const int MAX_DIMENSION = 128; // Maximum image dimension
+    const int MAX_IMAGES = 100;    // Maximum number of images to process
+    
+    // Open directory
+    DIR *dir;
+    struct dirent *entry;
+    
+    dir = opendir(image_dir);
+    if (!dir) {
+        fprintf(stderr, "Failed to open directory: %s\n", image_dir);
+        return 1;
+    }
+    
+    // Count JPEG files in directory
+    int jpg_count = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (has_extension(entry->d_name, "jpg") || has_extension(entry->d_name, "jpeg")) {
+            jpg_count++;
+            if (jpg_count >= MAX_IMAGES) {
+                break;
+            }
+        }
+    }
+    rewinddir(dir);
+    
+    if (jpg_count == 0) {
+        fprintf(stderr, "No JPEG images found in %s\n", image_dir);
+        closedir(dir);
+        return 1;
+    }
+    
+    printf("Found %d JPEG images in %s (limiting to %d)\n", 
+           jpg_count, image_dir, MAX_IMAGES);
+    
+    // Create CSV file
+    char csv_filename[256];
+    sprintf(csv_filename, "denoising_dataset_hilbert_%d_steps.csv", NUM_NOISE_STEPS);
+    FILE *csv_file = fopen(csv_filename, "w");
+    if (!csv_file) {
+        fprintf(stderr, "Failed to create CSV file %s\n", csv_filename);
+        closedir(dir);
+        return 1;
+    }
+    
+    // Process each JPEG file
+    int processed_count = 0;
+    int square_size = 0;
+    
+    while ((entry = readdir(dir)) != NULL && processed_count < MAX_IMAGES) {
+        if (has_extension(entry->d_name, "jpg") || has_extension(entry->d_name, "jpeg")) {
+            char filepath[512];
+            sprintf(filepath, "%s/%s", image_dir, entry->d_name);
+            
+            printf("\nProcessing image %d/%d: %s\n", processed_count + 1, jpg_count, entry->d_name);
+            
+            // Process the image and add its data to the CSV
+            int is_first_image = (processed_count == 0);
+            if (process_image(filepath, csv_file, MAX_DIMENSION, NUM_NOISE_STEPS, is_first_image, &square_size)) {
+                processed_count++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    fclose(csv_file);
+    
+    printf("\nComplete! Processed %d images.\n", processed_count);
+    printf("Dataset saved to %s\n", csv_filename);
+    printf("Square image dimensions: %d x %d\n", square_size, square_size);
+    printf("Each image contributed %d noise sequences\n", NUM_NOISE_STEPS);
+    printf("Total dataset size: %d rows x %d columns\n", 
+           processed_count * NUM_NOISE_STEPS, square_size * square_size);
     
     return 0;
 }
