@@ -4,6 +4,7 @@
 #include <math.h>
 #include <jpeglib.h>
 #include <fftw3.h>
+#include <time.h>
 
 typedef struct {
     unsigned char *data;
@@ -119,27 +120,28 @@ void hartley_ishift(double *shifted, double *data, int width, int height) {
     }
 }
 
-// Function to apply square low-pass filter to shifted Hartley transform
-void apply_square_filter(double *shifted, int width, int height, int cutoff_size) {
-    int center_x = width / 2;
-    int center_y = height / 2;
+// Function to add Gaussian noise to the Hartley transform
+void add_gaussian_noise(double *data, int width, int height, double noise_level) {
+    // Box-Muller transform for generating Gaussian random numbers
+    double noise_stddev = noise_level * 255.0; // Scale the noise level
     
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            // Calculate distance from center (maximum of x and y components)
-            int dx = abs(x - center_x);
-            int dy = abs(y - center_y);
-            
-            // Apply square filter - keep only frequencies within square centered at DC
-            if (dx > cutoff_size || dy > cutoff_size) {
-                shifted[y * width + x] = 0.0;
-            }
-        }
+    for (int i = 0; i < width * height; i++) {
+        double u1 = (double)rand() / RAND_MAX;
+        double u2 = (double)rand() / RAND_MAX;
+        
+        // Avoid log(0)
+        if (u1 < 1e-8) u1 = 1e-8;
+        
+        // Box-Muller transform
+        double z0 = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+        
+        // Add noise
+        data[i] += z0 * noise_stddev;
     }
 }
 
 // Function to save visualization of Hartley transform
-void save_visualization(const char *filename, double *data, int width, int height, int is_filtered) {
+void save_visualization(const char *filename, double *data, int width, int height, int is_noisy) {
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
     FILE *outfile;
@@ -207,7 +209,7 @@ void save_visualization(const char *filename, double *data, int width, int heigh
     free(vis_data);
     
     printf("Saved %s (Hartley transform %s)\n", 
-           filename, is_filtered ? "filtered" : "unfiltered");
+           filename, is_noisy ? "with noise" : "original");
 }
 
 // Function to compute the 2D Hartley Transform
@@ -359,8 +361,11 @@ void calculate_scaling_factors(int width, int height, int max_dim, int *new_widt
     }
 }
 
-int main(int argc, char *argv[]) {
-    const char *input_file = (argc > 1) ? argv[1] : "img.jpg";
+int main() {
+    // Seed the random number generator for Gaussian noise
+    srand(time(NULL));
+    
+    const char *input_file = "img.jpg";
     
     // Load the image
     Image img = load_jpeg(input_file);
@@ -371,8 +376,8 @@ int main(int argc, char *argv[]) {
     
     printf("Original image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
     
-    // Scale down the image if it's too big (max dimension of 512 pixels)
-    int max_dimension = 256;
+    // Scale down the image if it's too big (max dimension of 128 pixels)
+    int max_dimension = 128;
     int new_width, new_height;
     calculate_scaling_factors(img.width, img.height, max_dimension, &new_width, &new_height);
     
@@ -399,34 +404,34 @@ int main(int argc, char *argv[]) {
     double *shifted_data = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
     hartley_shift(hartley_data, shifted_data, scaled_img.width, scaled_img.height);
     
-    // Save the shifted Hartley transform
+    // Save the shifted Hartley transform (original)
     save_visualization("hartley.jpg", shifted_data, scaled_img.width, scaled_img.height, 0);
     
-    // Apply square low-pass filter (filter size is 25% of the image width)
-    int cutoff_size = scaled_img.width * 0.25;
-    printf("Applying square low-pass filter with half-width %d pixels\n", cutoff_size);
-    apply_square_filter(shifted_data, scaled_img.width, scaled_img.height, cutoff_size);
+    // Add Gaussian noise to the Hartley transform
+    double noise_level = 0.3; // Adjust this to control noise intensity (0.0 to 1.0)
+    printf("Adding Gaussian noise with level %.2f\n", noise_level);
+    add_gaussian_noise(shifted_data, scaled_img.width, scaled_img.height, noise_level);
     
-    // Save the filtered (still shifted) Hartley transform
-    save_visualization("hartley_filtered.jpg", shifted_data, scaled_img.width, scaled_img.height, 1);
+    // Save the noisy (still shifted) Hartley transform
+    save_visualization("hartley_noisy.jpg", shifted_data, scaled_img.width, scaled_img.height, 1);
     
-    // Inverse shift the filtered data back to original arrangement
-    double *filtered_hartley = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
-    hartley_ishift(shifted_data, filtered_hartley, scaled_img.width, scaled_img.height);
+    // Inverse shift the noisy data back to original arrangement
+    double *noisy_hartley = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
+    hartley_ishift(shifted_data, noisy_hartley, scaled_img.width, scaled_img.height);
     
-    // Compute inverse Hartley transform to get filtered image
-    unsigned char *filtered_image = inverse_hartley_transform(filtered_hartley, scaled_img.width, scaled_img.height);
+    // Compute inverse Hartley transform to get noisy image
+    unsigned char *noisy_image = inverse_hartley_transform(noisy_hartley, scaled_img.width, scaled_img.height);
     
-    // Save the filtered image
-    save_grayscale_image("img_filtered.jpg", filtered_image, scaled_img.width, scaled_img.height);
+    // Save the noisy image
+    save_grayscale_image("img_noisy.jpg", noisy_image, scaled_img.width, scaled_img.height);
     
     // Clean up
     free(scaled_img.data);
     free(grayscale);
-    free(filtered_image);
+    free(noisy_image);
     fftw_free(hartley_data);
     fftw_free(shifted_data);
-    fftw_free(filtered_hartley);
+    fftw_free(noisy_hartley);
     
     return 0;
 }
