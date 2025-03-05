@@ -7,8 +7,6 @@
 #include <limits.h>
 #include "ssm/gpu/ssm.h"
 
-#define MAX_LINE_LENGTH 1000000
-
 // ---------------------------------------------------------------------
 // Function: Propagate gradients between stacked models
 // ---------------------------------------------------------------------
@@ -87,9 +85,14 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* num_time
     // Reset file position
     rewind(file);
     
+    // Use getline to dynamically allocate line buffer
+    char* line = NULL;
+    size_t line_capacity = 0;
+    ssize_t line_length;
+    
     // Read first line to determine input dimension (features per sample)
-    char* line = (char*)malloc(MAX_LINE_LENGTH);
-    if (fgets(line, MAX_LINE_LENGTH, file) == NULL) {
+    line_length = getline(&line, &line_capacity, file);
+    if (line_length <= 0) {
         fprintf(stderr, "Error reading first line\n");
         free(line);
         fclose(file);
@@ -110,7 +113,7 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* num_time
     // Each denoising step is a timestep
     
     // In the denoising dataset, we have NUM_NOISE_STEPS (1024) rows per image
-    // and 100 images total
+    // and X images total
     int num_noise_steps = 1024;
     int num_images = total_lines / num_noise_steps;
     
@@ -129,17 +132,20 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* num_time
     
     // Read all data from CSV
     for (int row = 0; row < total_lines; row++) {
-        if (fgets(line, MAX_LINE_LENGTH, file) == NULL) {
+        line_length = getline(&line, &line_capacity, file);
+        if (line_length <= 0) {
             break;
         }
         
         // Parse CSV line
+        int col = 0;
         char* token = strtok(line, ",");
-        for (int d = 0; d < dim && token != NULL; d++) {
+        while (token != NULL && col < dim) {
             float value = atof(token);
             // Store in temporary array
-            temp_data[row * dim + d] = value;
+            temp_data[row * dim + col] = value;
             token = strtok(NULL, ",");
+            col++;
         }
     }
     
@@ -151,14 +157,13 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* num_time
     // [image 0, timestep 1023]
     // [image 1, timestep 0]
     // ...
-
+    
     // We want to reorganize as:
     // [image 0, timestep 0]
     // [image 1, timestep 0]
     // ...
     // [image 99, timestep 0]
     // [image 0, timestep 1]
-    // [image 1, timestep 1]
     // ...
     
     for (int t = 0; t < *num_timesteps; t++) {
@@ -176,7 +181,7 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* num_time
     
     // Free temporary storage
     free(temp_data);
-    free(line);
+    free(line);  // Free the dynamically allocated line buffer
     fclose(file);
     
     return dim;
@@ -364,15 +369,10 @@ int main(int argc, char *argv[]) {
             
             // Print progress
             if (t == 0 || t == num_timesteps - 2 || (t + 1) % 100 == 0) {
-                printf("Epoch %d/%d, Step %d/%d, Loss: %f, Avg Loss: %f\n", 
-                       epoch + 1, num_epochs, t + 1, num_timesteps - 1, 
-                       loss, epoch_loss/(t+1));
+                printf("Epoch %d/%d, Step %d/%d, Avg Loss: %f\n", 
+                       epoch + 1, num_epochs, t + 1, num_timesteps - 1, epoch_loss/(t+1));
             }
         }
-        
-        // Calculate average epoch loss
-        float avg_epoch_loss = epoch_loss / (num_timesteps - 1);
-        printf("Epoch %d/%d completed, Average Loss: %f\n", epoch + 1, num_epochs, avg_epoch_loss);
     }
     
     // Save the final models

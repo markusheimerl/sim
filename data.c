@@ -21,7 +21,7 @@
 #define IMAGES_DIR "coco_images"
 #define ANNOTATIONS_ZIP "annotations.zip"
 #define IMAGES_ZIP "images.zip"
-#define MAX_IMAGES 100
+#define MAX_IMAGES 64
 #define PROGRESS_BAR_WIDTH 50
 
 // Denoising parameters
@@ -450,15 +450,15 @@ float* flatten_with_hilbert_float(unsigned char *grayscale, int width, int heigh
 // Generate pure noise image with values between 0-1
 void generate_pure_noise(float *data, int length) {
     for (int i = 0; i < length; i++) {
-        data[i] = (float)rand() / RAND_MAX;
+        data[i] = (float)rand() / (float)RAND_MAX;
     }
 }
 
 // Add Gaussian noise with specified standard deviation to a normalized float array
 void add_gaussian_noise_float(float *data, int length, float noise_level) {
     for (int i = 0; i < length; i++) {
-        double u1 = (double)rand() / RAND_MAX;
-        double u2 = (double)rand() / RAND_MAX;
+        double u1 = (double)rand() / (float)RAND_MAX;
+        double u2 = (double)rand() / (float)RAND_MAX;
         
         // Avoid log(0)
         if (u1 < 1e-8) u1 = 1e-8;
@@ -784,11 +784,11 @@ int process_image_for_denoising(const char *filepath, FILE *csv_file, int is_fir
     
     // Create increasingly noisy versions of the image
     printf("Generating %d noise steps for %s...\n", NUM_NOISE_STEPS, filepath);
-    /*
+    
     // For the first image only, save visualization of noise stages
     int *vis_steps = NULL;
     int num_vis_steps = 0;
-    
+    /*
     if (is_first_image) {
         // Define visualization steps for the first image only
         int steps[] = {0, 1, 4, 16, 64, 256, 512, 768, 1022, 1023};
