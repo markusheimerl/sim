@@ -310,52 +310,118 @@ unsigned char* convert_to_grayscale(Image img) {
     return grayscale;
 }
 
-int main() {
+// Scale an image to a new size
+Image scale_image(Image src, int new_width, int new_height) {
+    Image dst = {0};
+    dst.width = new_width;
+    dst.height = new_height;
+    dst.channels = src.channels;
+    dst.data = (unsigned char *)malloc(new_width * new_height * src.channels);
+    
+    // Simple nearest neighbor scaling - faster but less quality
+    // Could be replaced with better algorithms like bilinear or bicubic
+    double x_ratio = (double)src.width / new_width;
+    double y_ratio = (double)src.height / new_height;
+    
+    for (int y = 0; y < new_height; y++) {
+        for (int x = 0; x < new_width; x++) {
+            int src_x = (int)(x * x_ratio);
+            int src_y = (int)(y * y_ratio);
+            
+            if (src_x >= src.width) src_x = src.width - 1;
+            if (src_y >= src.height) src_y = src.height - 1;
+            
+            for (int c = 0; c < src.channels; c++) {
+                int src_idx = (src_y * src.width + src_x) * src.channels + c;
+                int dst_idx = (y * new_width + x) * src.channels + c;
+                dst.data[dst_idx] = src.data[src_idx];
+            }
+        }
+    }
+    
+    return dst;
+}
+
+// Calculate scaling factors to resize an image to a maximum dimension
+void calculate_scaling_factors(int width, int height, int max_dim, int *new_width, int *new_height) {
+    if (width <= max_dim && height <= max_dim) {
+        // Image is already small enough
+        *new_width = width;
+        *new_height = height;
+    } else if (width > height) {
+        // Width is the larger dimension
+        *new_width = max_dim;
+        *new_height = (int)(height * ((double)max_dim / width));
+    } else {
+        // Height is the larger dimension
+        *new_height = max_dim;
+        *new_width = (int)(width * ((double)max_dim / height));
+    }
+}
+
+int main(int argc, char *argv[]) {
+    const char *input_file = (argc > 1) ? argv[1] : "img.jpg";
+    
     // Load the image
-    Image img = load_jpeg("img.jpg");
+    Image img = load_jpeg(input_file);
     if (img.data == NULL) {
-        fprintf(stderr, "Failed to load image\n");
+        fprintf(stderr, "Failed to load image: %s\n", input_file);
         return 1;
     }
     
-    printf("Image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
+    printf("Original image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
+    
+    // Scale down the image if it's too big (max dimension of 512 pixels)
+    int max_dimension = 256;
+    int new_width, new_height;
+    calculate_scaling_factors(img.width, img.height, max_dimension, &new_width, &new_height);
+    
+    Image scaled_img;
+    if (new_width != img.width || new_height != img.height) {
+        printf("Scaling image to %d x %d\n", new_width, new_height);
+        scaled_img = scale_image(img, new_width, new_height);
+        free(img.data);  // Free original image after scaling
+    } else {
+        printf("No scaling needed, dimensions already appropriate\n");
+        scaled_img = img;  // Use original image
+    }
     
     // Convert to grayscale
-    unsigned char *grayscale = convert_to_grayscale(img);
+    unsigned char *grayscale = convert_to_grayscale(scaled_img);
     
     // Save the grayscale image
-    save_grayscale_image("grayscale.jpg", grayscale, img.width, img.height);
+    save_grayscale_image("grayscale.jpg", grayscale, scaled_img.width, scaled_img.height);
     
     // Compute the Hartley transform
-    double *hartley_data = compute_hartley_transform(grayscale, img.width, img.height);
+    double *hartley_data = compute_hartley_transform(grayscale, scaled_img.width, scaled_img.height);
     
     // Create shifted version of the transform
-    double *shifted_data = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
-    hartley_shift(hartley_data, shifted_data, img.width, img.height);
+    double *shifted_data = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
+    hartley_shift(hartley_data, shifted_data, scaled_img.width, scaled_img.height);
     
     // Save the shifted Hartley transform
-    save_visualization("hartley.jpg", shifted_data, img.width, img.height, 0);
+    save_visualization("hartley.jpg", shifted_data, scaled_img.width, scaled_img.height, 0);
     
     // Apply square low-pass filter (filter size is 25% of the image width)
-    int cutoff_size = img.width * 0.25;
+    int cutoff_size = scaled_img.width * 0.25;
     printf("Applying square low-pass filter with half-width %d pixels\n", cutoff_size);
-    apply_square_filter(shifted_data, img.width, img.height, cutoff_size);
+    apply_square_filter(shifted_data, scaled_img.width, scaled_img.height, cutoff_size);
     
     // Save the filtered (still shifted) Hartley transform
-    save_visualization("hartley_filtered.jpg", shifted_data, img.width, img.height, 1);
+    save_visualization("hartley_filtered.jpg", shifted_data, scaled_img.width, scaled_img.height, 1);
     
     // Inverse shift the filtered data back to original arrangement
-    double *filtered_hartley = (double *)fftw_malloc(sizeof(double) * img.width * img.height);
-    hartley_ishift(shifted_data, filtered_hartley, img.width, img.height);
+    double *filtered_hartley = (double *)fftw_malloc(sizeof(double) * scaled_img.width * scaled_img.height);
+    hartley_ishift(shifted_data, filtered_hartley, scaled_img.width, scaled_img.height);
     
     // Compute inverse Hartley transform to get filtered image
-    unsigned char *filtered_image = inverse_hartley_transform(filtered_hartley, img.width, img.height);
+    unsigned char *filtered_image = inverse_hartley_transform(filtered_hartley, scaled_img.width, scaled_img.height);
     
     // Save the filtered image
-    save_grayscale_image("img_filtered.jpg", filtered_image, img.width, img.height);
+    save_grayscale_image("img_filtered.jpg", filtered_image, scaled_img.width, scaled_img.height);
     
     // Clean up
-    free(img.data);
+    free(scaled_img.data);
     free(grayscale);
     free(filtered_image);
     fftw_free(hartley_data);
