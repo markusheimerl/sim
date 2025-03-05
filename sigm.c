@@ -68,15 +68,15 @@ int count_lines(const char* filename) {
     return count;
 }
 
-// Load and preprocess CSV data
-int load_csv_data(const char* filename, float** h_data_time_major, int* seq_length, int* batch_size, int max_samples) {
+// Load and preprocess CSV data with batching
+int load_csv_data(const char* filename, float** h_data_time_major, int* num_timesteps, int* batch_size, int* feature_dim) {
     FILE* file = fopen(filename, "r");
     if (!file) {
         fprintf(stderr, "Error opening file %s\n", filename);
         return 0;
     }
     
-    // Count lines to determine sequence length
+    // Count lines to determine total rows
     int total_lines = count_lines(filename);
     if (total_lines <= 0) {
         fprintf(stderr, "Error counting lines or empty file\n");
@@ -87,7 +87,7 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* seq_leng
     // Reset file position
     rewind(file);
     
-    // Read first line to determine input dimension
+    // Read first line to determine input dimension (features per sample)
     char* line = (char*)malloc(MAX_LINE_LENGTH);
     if (fgets(line, MAX_LINE_LENGTH, file) == NULL) {
         fprintf(stderr, "Error reading first line\n");
@@ -105,20 +105,30 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* seq_leng
     // Reset file position
     rewind(file);
     
-    // Limit total samples if needed
-    int actual_samples = (max_samples > 0 && max_samples < total_lines) ? max_samples : total_lines;
+    // Determine proper batch size and number of timesteps
+    // Each image is processed as a batch sample
+    // Each denoising step is a timestep
+    
+    // In the denoising dataset, we have NUM_NOISE_STEPS (1024) rows per image
+    // and 100 images total
+    int num_noise_steps = 1024;
+    int num_images = total_lines / num_noise_steps;
     
     printf("Found %d lines with %d dimensions each\n", total_lines, dim);
-    printf("Using %d sequences for training\n", actual_samples);
+    printf("Detected %d images, each with %d noise steps\n", num_images, num_noise_steps);
     
-    *seq_length = actual_samples;
-    *batch_size = 1;  // For image denoising, we use batch size of 1 for simplicity
+    *batch_size = num_images;     // Each image is a batch sample
+    *num_timesteps = num_noise_steps;  // Each denoising step is a timestep
+    *feature_dim = dim;          // Dimension of each sample
     
-    // Allocate memory for data in time-major format
-    *h_data_time_major = (float*)malloc((*seq_length) * dim * sizeof(float));
+    // Allocate data arrays: [timesteps][batch_size][feature_dim]
+    *h_data_time_major = (float*)malloc((*num_timesteps) * (*batch_size) * dim * sizeof(float));
     
-    // Read data
-    for (int t = 0; t < *seq_length; t++) {
+    // Temporary array to store all data in row-major format (batch/timestep sequential in CSV)
+    float* temp_data = (float*)malloc(total_lines * dim * sizeof(float));
+    
+    // Read all data from CSV
+    for (int row = 0; row < total_lines; row++) {
         if (fgets(line, MAX_LINE_LENGTH, file) == NULL) {
             break;
         }
@@ -127,12 +137,45 @@ int load_csv_data(const char* filename, float** h_data_time_major, int* seq_leng
         char* token = strtok(line, ",");
         for (int d = 0; d < dim && token != NULL; d++) {
             float value = atof(token);
-            // Store in time-major format
-            (*h_data_time_major)[t * dim + d] = value;
+            // Store in temporary array
+            temp_data[row * dim + d] = value;
             token = strtok(NULL, ",");
         }
     }
     
+    // Now reorganize data into time-major format
+    // In the CSV, data is organized as:
+    // [image 0, timestep 0]
+    // [image 0, timestep 1]
+    // ...
+    // [image 0, timestep 1023]
+    // [image 1, timestep 0]
+    // ...
+
+    // We want to reorganize as:
+    // [image 0, timestep 0]
+    // [image 1, timestep 0]
+    // ...
+    // [image 99, timestep 0]
+    // [image 0, timestep 1]
+    // [image 1, timestep 1]
+    // ...
+    
+    for (int t = 0; t < *num_timesteps; t++) {
+        for (int b = 0; b < *batch_size; b++) {
+            // Source index in the original data
+            int src_idx = (b * (*num_timesteps) + t) * dim;
+            
+            // Destination index in time-major format
+            int dst_idx = (t * (*batch_size) + b) * dim;
+            
+            // Copy this sample's features
+            memcpy((*h_data_time_major) + dst_idx, temp_data + src_idx, dim * sizeof(float));
+        }
+    }
+    
+    // Free temporary storage
+    free(temp_data);
     free(line);
     fclose(file);
     
@@ -144,7 +187,6 @@ int main(int argc, char *argv[]) {
     srand(time(NULL) ^ getpid());
     
     const char* csv_file = "denoising_dataset_hilbert_1024_steps.csv";
-    int max_samples = 1024;  // Default to use all steps in the denoising process
     
     // Model parameters
     int input_dim = 0;       // Will be determined from CSV
@@ -160,16 +202,18 @@ int main(int argc, char *argv[]) {
     
     // Load data from CSV
     float* h_data_time_major = NULL;
-    int seq_length = 0;
-    int batch_size = 1;
+    int num_timesteps = 0;
+    int batch_size = 0;
+    int feature_dim = 0;
     
-    input_dim = load_csv_data(csv_file, &h_data_time_major, &seq_length, &batch_size, max_samples);
+    input_dim = load_csv_data(csv_file, &h_data_time_major, &num_timesteps, &batch_size, &feature_dim);
     if (input_dim == 0) {
         fprintf(stderr, "Failed to load data\n");
         return 1;
     }
     
-    printf("Data loaded: %d steps with %d dimensions\n", seq_length, input_dim);
+    printf("Data loaded: %d images, %d denoising steps, %d dimensions\n", 
+           batch_size, num_timesteps, input_dim);
     printf("Using state dimension: %d\n", state_dim);
     printf("Hidden layer dimensions: %d, %d, %d\n", layer1_dim, layer2_dim, layer3_dim);
     printf("Learning rate: %.6f\n", learning_rate);
@@ -177,9 +221,9 @@ int main(int argc, char *argv[]) {
     
     // Transfer data to GPU
     float *d_data_time_major;
-    CHECK_CUDA(cudaMalloc(&d_data_time_major, seq_length * input_dim * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_data_time_major, num_timesteps * batch_size * input_dim * sizeof(float)));
     CHECK_CUDA(cudaMemcpy(d_data_time_major, h_data_time_major, 
-                         seq_length * input_dim * sizeof(float), 
+                         num_timesteps * batch_size * input_dim * sizeof(float), 
                          cudaMemcpyHostToDevice));
     
     // Free host memory as it's no longer needed
@@ -249,7 +293,7 @@ int main(int argc, char *argv[]) {
     CHECK_CUDA(cudaMalloc(&d_layer2_output, batch_size * layer2_dim * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_layer3_output, batch_size * layer3_dim * sizeof(float)));
     
-    printf("\nStarting training for %d epochs with %d steps...\n", num_epochs, seq_length);
+    printf("\nStarting training for %d epochs with %d steps...\n", num_epochs, num_timesteps);
     
     // Training loop
     for (int epoch = 0; epoch < num_epochs; epoch++) {
@@ -262,10 +306,11 @@ int main(int argc, char *argv[]) {
         float epoch_loss = 0.0f;
         
         // Process each timestep (denoising step)
-        for (int t = 0; t < seq_length - 1; t++) {
+        for (int t = 0; t < num_timesteps - 1; t++) {
             // Get current timestep inputs and targets
-            float* d_X_t = d_data_time_major + t * input_dim;
-            float* d_y_t = d_data_time_major + (t + 1) * input_dim;  // Next step is target (less noise)
+            // For denoising, input is current noise level, target is next noise level (less noise)
+            float* d_X_t = d_data_time_major + t * batch_size * input_dim;
+            float* d_y_t = d_data_time_major + (t + 1) * batch_size * input_dim;
             
             // Forward pass: layer 1 SSM
             forward_pass(layer1_ssm, d_X_t);
@@ -318,15 +363,15 @@ int main(int argc, char *argv[]) {
             update_weights(layer4_ssm, learning_rate);
             
             // Print progress
-            if (t == 0 || t == seq_length - 2 || (t + 1) % 100 == 0) {
+            if (t == 0 || t == num_timesteps - 2 || (t + 1) % 100 == 0) {
                 printf("Epoch %d/%d, Step %d/%d, Loss: %f, Avg Loss: %f\n", 
-                       epoch + 1, num_epochs, t + 1, seq_length - 1, 
+                       epoch + 1, num_epochs, t + 1, num_timesteps - 1, 
                        loss, epoch_loss/(t+1));
             }
         }
         
         // Calculate average epoch loss
-        float avg_epoch_loss = epoch_loss / (seq_length - 1);
+        float avg_epoch_loss = epoch_loss / (num_timesteps - 1);
         printf("Epoch %d/%d completed, Average Loss: %f\n", epoch + 1, num_epochs, avg_epoch_loss);
     }
     
