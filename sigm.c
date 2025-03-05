@@ -173,10 +173,8 @@ void calculate_scaling_factors(int width, int height, int max_dim, int *new_widt
     }
 }
 
-// Function to add Gaussian noise to a 1D array
-void add_gaussian_noise(unsigned char *data, int length, double noise_level) {
-    double noise_stddev = noise_level * 255.0; // Scale the noise level
-    
+// Add Gaussian noise with specified standard deviation to a normalized float array
+void add_gaussian_noise_float(float *data, int length, float noise_level) {
     for (int i = 0; i < length; i++) {
         double u1 = (double)rand() / RAND_MAX;
         double u2 = (double)rand() / RAND_MAX;
@@ -187,11 +185,26 @@ void add_gaussian_noise(unsigned char *data, int length, double noise_level) {
         // Box-Muller transform
         double z0 = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
         
-        // Add noise and clip to valid range
-        int pixel_value = (int)data[i] + (int)(z0 * noise_stddev);
-        if (pixel_value < 0) pixel_value = 0;
-        if (pixel_value > 255) pixel_value = 255;
-        data[i] = (unsigned char)pixel_value;
+        // Add noise to normalized data
+        data[i] += (float)(z0 * noise_level);
+        
+        // Clamp values between 0 and 1
+        if (data[i] < 0.0f) data[i] = 0.0f;
+        if (data[i] > 1.0f) data[i] = 1.0f;
+    }
+}
+
+// Generate pure noise image with values between 0-1
+void generate_pure_noise(float *data, int length) {
+    for (int i = 0; i < length; i++) {
+        data[i] = (float)rand() / RAND_MAX;
+    }
+}
+
+// Blend between source image and target image with given factor (0.0 = source, 1.0 = target)
+void blend_images(float *result, float *source, float *target, int length, float blend_factor) {
+    for (int i = 0; i < length; i++) {
+        result[i] = source[i] * (1.0f - blend_factor) + target[i] * blend_factor;
     }
 }
 
@@ -345,20 +358,20 @@ void create_hilbert_mapping(int width, int height, int **to_1d, int **to_2d) {
 }
 
 // Flatten a grayscale image using Hilbert curve ordering
-unsigned char* flatten_with_hilbert(unsigned char *grayscale, int width, int height, int **to_2d) {
+float* flatten_with_hilbert_float(unsigned char *grayscale, int width, int height, int **to_2d) {
     // Create forward and backward mappings
     int *to_1d;
     create_hilbert_mapping(width, height, &to_1d, to_2d);
     
-    // Create the flattened array
-    unsigned char *flattened = (unsigned char*)malloc(width * height);
+    // Create the flattened array as float (normalized 0-1)
+    float *flattened = (float*)malloc(width * height * sizeof(float));
     
-    // Flatten using the mapping
+    // Flatten using the mapping and normalize to 0-1
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             int orig_idx = y * width + x;
             int flat_idx = to_1d[orig_idx];
-            flattened[flat_idx] = grayscale[orig_idx];
+            flattened[flat_idx] = grayscale[orig_idx] / 255.0f;
         }
     }
     
@@ -367,21 +380,34 @@ unsigned char* flatten_with_hilbert(unsigned char *grayscale, int width, int hei
 }
 
 // Unflatten a 1D array back to a 2D image
-unsigned char* unflatten_with_hilbert(unsigned char *flattened, int width, int height, int *to_2d) {
+unsigned char* unflatten_with_hilbert(float *flattened, int width, int height, int *to_2d) {
     unsigned char *unflattened = (unsigned char*)malloc(width * height);
     
     for (int i = 0; i < width * height; i++) {
-        unflattened[to_2d[i]] = flattened[i];
+        // Convert back from normalized float to byte
+        unflattened[to_2d[i]] = (unsigned char)(flattened[i] * 255.0f);
     }
     
     return unflattened;
 }
 
+// Write a float array to a CSV file as a row
+void write_float_array_to_csv(FILE *fp, float *array, int length) {
+    for (int i = 0; i < length; i++) {
+        fprintf(fp, "%.6f", array[i]);
+        if (i < length - 1) {
+            fprintf(fp, ",");
+        }
+    }
+    fprintf(fp, "\n");
+}
+
 int main() {
-    // Seed the random number generator for Gaussian noise
+    // Seed the random number generator
     srand(time(NULL));
     
     const char *input_file = "img.jpg";
+    const int NUM_NOISE_STEPS = 1024;
     
     // Load the image
     Image img = load_jpeg(input_file);
@@ -393,7 +419,7 @@ int main() {
     printf("Original image loaded: %d x %d with %d channels\n", img.width, img.height, img.channels);
     
     // Step 1: Scale down the image to a maximum dimension
-    int max_dimension = 128; // Maximum dimension for processing
+    int max_dimension = 128; // Use 128 as requested
     int new_width, new_height;
     calculate_scaling_factors(img.width, img.height, max_dimension, &new_width, &new_height);
     
@@ -418,30 +444,114 @@ int main() {
     
     // Step 4: Create Hilbert mapping and flatten the image
     int *to_2d;
-    unsigned char *flattened = flatten_with_hilbert(grayscale, square_img.width, square_img.height, &to_2d);
+    float *clean_flattened = flatten_with_hilbert_float(grayscale, square_img.width, square_img.height, &to_2d);
     
-    // Save the flattened data as JPEG
-    save_1d_as_jpeg("flattened.jpg", flattened, square_img.width * square_img.height);
+    // Get the length of the flattened array
+    int flattened_length = square_img.width * square_img.height;
     
-    // Step 5: Add Gaussian noise to the flattened 1D array
-    double noise_level = 0.05; // Adjust this to control noise intensity (0.0 to 1.0)
-    printf("Adding Gaussian noise with level %.2f to the flattened array\n", noise_level);
-    add_gaussian_noise(flattened, square_img.width * square_img.height, noise_level);
+    // Create a CSV file for the dataset
+    char csv_filename[256];
+    sprintf(csv_filename, "denoising_dataset_%dx%d.csv", square_img.width, square_img.height);
+    FILE *csv_file = fopen(csv_filename, "w");
+    if (!csv_file) {
+        fprintf(stderr, "Failed to create CSV file %s\n", csv_filename);
+        return 1;
+    }
     
-    // Save the noisy flattened data
-    save_1d_as_jpeg("flattened_noisy.jpg", flattened, square_img.width * square_img.height);
+    // Allocate an array to hold all the noisy versions
+    float **noisy_arrays = (float**)malloc(NUM_NOISE_STEPS * sizeof(float*));
     
-    // Step 6: Unflatten the noisy data back to 2D
-    unsigned char *noisy_image = unflatten_with_hilbert(flattened, square_img.width, square_img.height, to_2d);
+    // Create a pure noise image for the most noisy step
+    float *pure_noise = (float*)malloc(flattened_length * sizeof(float));
+    generate_pure_noise(pure_noise, flattened_length);
     
-    // Save the noisy image
-    save_grayscale_image("img_noisy.jpg", noisy_image, square_img.width, square_img.height);
+    // Create increasingly noisy versions of the image
+    printf("Generating %d noise steps...\n", NUM_NOISE_STEPS);
     
-    // Clean up
+    // For visualization, save a few stages
+    int vis_steps[] = {0, 1, 4, 16, 64, 256, 512, 768, 1022, 1023};
+    int num_vis_steps = sizeof(vis_steps) / sizeof(vis_steps[0]);
+    
+    for (int i = 0; i < NUM_NOISE_STEPS; i++) {
+        // Allocate memory for this noise step
+        noisy_arrays[i] = (float*)malloc(flattened_length * sizeof(float));
+        
+        // Calculate the blend factor (0 = clean image, 1 = pure noise)
+        // Use a more aggressive curve to ensure the highest noise step is almost pure noise
+        float blend_factor = (float)i / (NUM_NOISE_STEPS - 1);
+        
+        // Apply a power curve to make higher noise levels even more noisy
+        // The exponent 0.5 creates a curve that gets to high noise levels faster
+        blend_factor = powf(blend_factor, 0.5f);
+        
+        // For the last few steps, ensure we reach pure noise
+        if (i >= NUM_NOISE_STEPS - 5) {
+            // Blend quickly to pure noise in the last 5 steps
+            float last_steps_factor = (float)(i - (NUM_NOISE_STEPS - 5)) / 4.0f;
+            blend_factor = blend_factor * (1.0f - last_steps_factor) + last_steps_factor;
+        }
+        
+        // Use the blend factor to interpolate between clean image and pure noise
+        blend_images(noisy_arrays[i], clean_flattened, pure_noise, flattened_length, blend_factor);
+        
+        // Add additional random noise to avoid too smooth transitions
+        float noise_level = 0.05f * blend_factor; // Scale noise with blend factor
+        add_gaussian_noise_float(noisy_arrays[i], flattened_length, noise_level);
+        
+        // Make the final step pure noise
+        if (i == NUM_NOISE_STEPS - 1) {
+            memcpy(noisy_arrays[i], pure_noise, flattened_length * sizeof(float));
+        }
+        
+        // Visualize select noise levels
+        for (int v = 0; v < num_vis_steps; v++) {
+            if (i == vis_steps[v]) {
+                // Convert back to image and save for visualization
+                unsigned char *noisy_image = unflatten_with_hilbert(noisy_arrays[i], 
+                                                                   square_img.width, square_img.height, to_2d);
+                char vis_filename[256];
+                sprintf(vis_filename, "noisy_%d_of_%d.jpg", i, NUM_NOISE_STEPS-1);
+                save_grayscale_image(vis_filename, noisy_image, square_img.width, square_img.height);
+                free(noisy_image);
+                
+                printf("Saved visualization for noise step %d (blend factor: %.4f)\n", 
+                       i, blend_factor);
+            }
+        }
+        
+        // Show progress
+        if (i % 100 == 0 || i == NUM_NOISE_STEPS - 1) {
+            printf("Generated noise step %d/%d (blend factor: %.4f)\n", 
+                   i+1, NUM_NOISE_STEPS, blend_factor);
+        }
+    }
+    
+    // Write the CSV file in reverse order (from most noisy to clean)
+    printf("Writing CSV file with %d rows...\n", NUM_NOISE_STEPS);
+    for (int i = NUM_NOISE_STEPS - 1; i >= 0; i--) {
+        write_float_array_to_csv(csv_file, noisy_arrays[i], flattened_length);
+        
+        // Show progress
+        if (i % 100 == 0 || i == 0) {
+            printf("Wrote row %d/%d to CSV\n", NUM_NOISE_STEPS - i, NUM_NOISE_STEPS);
+        }
+    }
+    
+    // Close the CSV file
+    fclose(csv_file);
+    printf("CSV dataset created: %s\n", csv_filename);
+    
+    // Clean up all noisy arrays
+    for (int i = 0; i < NUM_NOISE_STEPS; i++) {
+        free(noisy_arrays[i]);
+    }
+    free(noisy_arrays);
+    free(pure_noise);
+    
+    // Clean up other allocations
     free(square_img.data);
     free(grayscale);
-    free(flattened);
-    free(noisy_image);
+    free(clean_flattened);
     free(to_2d);
     
     return 0;
