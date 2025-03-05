@@ -14,7 +14,6 @@
 #define COCO_IMAGES_URL "http://images.cocodataset.org/zips/val2017.zip"
 #define TEMP_DIR "coco_temp"
 #define IMAGES_DIR "coco_images"
-#define OUTPUT_FILE "coco_data.txt"
 #define ANNOTATIONS_ZIP "annotations.zip"
 #define IMAGES_ZIP "images.zip"
 #define MAX_IMAGES 100  // Limit to download for demonstration
@@ -138,6 +137,25 @@ int execute_command(const char *command) {
     return 1;
 }
 
+// Function to sanitize caption for use as a filename
+void sanitize_filename(char *filename, const char *caption) {
+    int i, j = 0;
+    
+    // Copy and sanitize the caption to use as a filename
+    for (i = 0; caption[i] != '\0' && j < 80; i++) {
+        char c = caption[i];
+        // Replace spaces with underscores and remove special characters
+        if (isalnum(c) || c == '_' || c == '-' || c == ' ') {
+            if (c == ' ') c = '_';
+            filename[j++] = c;
+        }
+    }
+    
+    // Ensure we don't exceed filename length limits and add extension
+    filename[MIN(j, 80)] = '\0';  // Truncate if too long
+    strcat(filename, ".jpg");
+}
+
 int main() {
     // Initialize curl globally
     curl_global_init(CURL_GLOBAL_ALL);
@@ -236,9 +254,6 @@ int main() {
             sprintf(id_str, "%lld", json_integer_value(id_json));
             json_object_set(image_map, id_str, file_name_json);
         }
-        
-        // Limit for demonstration
-        if (i >= MAX_IMAGES) break;
     }
     
     // Step 4: Download a subset of images from COCO
@@ -251,25 +266,21 @@ int main() {
     
     // Step 5: Extract images
     printf("Step 5: Extracting images (this might take a while)...\n");
-    sprintf(unzip_cmd, "unzip -q -o %s -d %s", images_path, IMAGES_DIR);
+    sprintf(unzip_cmd, "unzip -q -o %s -d %s", images_path, TEMP_DIR);
     if (!execute_command(unzip_cmd)) {
         json_decref(image_map);
         json_decref(root);
         return 1;
     }
     
-    // Step 6: Create output file with captions
-    printf("Step 6: Creating output file with image paths and captions...\n");
-    FILE *output = fopen(OUTPUT_FILE, "w");
-    if (!output) {
-        fprintf(stderr, "Failed to open output file: %s\n", OUTPUT_FILE);
-        json_decref(image_map);
-        json_decref(root);
-        return 1;
-    }
+    // Step 6: Process images and create caption-based filenames
+    printf("Step 6: Processing images with caption-based filenames...\n");
     
     size_t annotation_count = json_array_size(annotations);
     size_t processed = 0;
+    
+    // Track which image IDs we've already processed to avoid duplicates
+    json_t *processed_images = json_object();
     
     json_t *annotation;
     json_array_foreach(annotations, i, annotation) {
@@ -277,20 +288,42 @@ int main() {
         json_t *caption_json = json_object_get(annotation, "caption");
         
         if (json_is_integer(image_id_json) && json_is_string(caption_json)) {
+            long long image_id = json_integer_value(image_id_json);
+            const char *caption = json_string_value(caption_json);
+            
             char id_str[32];
-            sprintf(id_str, "%lld", json_integer_value(image_id_json));
+            sprintf(id_str, "%lld", image_id);
+            
+            // Check if we've already processed this image (to avoid duplicates)
+            if (json_object_get(processed_images, id_str) != NULL) {
+                continue;
+            }
             
             json_t *filename_json = json_object_get(image_map, id_str);
             if (filename_json && json_is_string(filename_json)) {
-                fprintf(output, "%s/%s\t%s\n",
-                        IMAGES_DIR,
-                        json_string_value(filename_json),
-                        json_string_value(caption_json));
+                const char *original_filename = json_string_value(filename_json);
                 
-                processed++;
+                // Generate sanitized filename from caption
+                char sanitized_filename[100];
+                sanitize_filename(sanitized_filename, caption);
                 
-                if (processed % 100 == 0) {
-                    print_progress_bar(processed, MIN(annotation_count, MAX_IMAGES), "Processing");
+                // Create complete paths
+                char src_path[512], dest_path[512];
+                sprintf(src_path, "%s/val2017/%s", TEMP_DIR, original_filename);
+                sprintf(dest_path, "%s/%s", IMAGES_DIR, sanitized_filename);
+                
+                // Copy the file to destination with new name
+                char copy_cmd[1024];
+                sprintf(copy_cmd, "cp %s %s", src_path, dest_path);
+                if (execute_command(copy_cmd)) {
+                    // Mark this image as processed
+                    json_object_set(processed_images, id_str, json_true());
+                    
+                    processed++;
+                    
+                    if (processed % 10 == 0) {
+                        print_progress_bar(processed, MIN(annotation_count, MAX_IMAGES), "Processing");
+                    }
                 }
             }
         }
@@ -302,7 +335,7 @@ int main() {
     print_progress_bar(processed, processed, "Processing");
     printf("\n");
     
-    fclose(output);
+    json_decref(processed_images);
     json_decref(image_map);
     json_decref(root);
     
@@ -317,8 +350,7 @@ int main() {
     
     printf("\nProcessing complete:\n");
     printf("- Total images processed: %zu\n", processed);
-    printf("- Output written to %s\n", OUTPUT_FILE);
-    printf("- Format: [image_path]\\t[caption]\n");
+    printf("- Images saved to %s/ directory with caption filenames\n", IMAGES_DIR);
     printf("- Temporary files removed from %s\n", TEMP_DIR);
     printf("\nYou can now use this data to train your image synthesis model.\n");
     
