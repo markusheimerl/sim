@@ -6,7 +6,7 @@
 #include <sys/stat.h>
 #include "sim.h"
 
-DiffusionModel* model = NULL;
+SIM* model = NULL;
 
 // SIGINT handler to save model and exit
 void handle_sigint(int signum) {
@@ -45,7 +45,7 @@ int extract_cifar10_if_needed(const char* tar_path, const char* extract_dir) {
     return 1;
 }
 
-void save_sample_image(DiffusionModel* model, float* d_sample, int sample_idx, const char* prefix) {
+void save_sample_image(SIM* model, float* d_sample, int sample_idx, const char* prefix) {
     // Convert patches back to image
     float* d_image;
     CHECK_CUDA(cudaMalloc(&d_image, 32 * 32 * 3 * sizeof(float)));

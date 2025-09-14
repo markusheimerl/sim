@@ -91,8 +91,8 @@ __global__ static void generate_noise_kernel(float* noise, curandState* states, 
 }
 
 // Initialize the diffusion model
-DiffusionModel* init_diffusion_model(int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
-    DiffusionModel* model = (DiffusionModel*)malloc(sizeof(DiffusionModel));
+SIM* init_diffusion_model(int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
+    SIM* model = (SIM*)malloc(sizeof(SIM));
     
     // Store dimensions
     model->d_model = d_model;
@@ -197,7 +197,7 @@ DiffusionModel* init_diffusion_model(int d_model, int hidden_dim, int num_layers
 }
 
 // Free diffusion model
-void free_diffusion_model(DiffusionModel* model) {
+void free_diffusion_model(SIM* model) {
     free_transformer(model->transformer);
     
     cudaFree(model->d_patch_projection); cudaFree(model->d_patch_projection_grad);
@@ -230,7 +230,7 @@ void patches_to_image(float* d_images, float* d_patches, int batch_size) {
 }
 
 // Forward diffusion process (add noise)
-void forward_diffusion(DiffusionModel* model, float* d_noisy_patches, float* d_clean_patches, int* timesteps, int batch_size) {
+void forward_diffusion(SIM* model, float* d_noisy_patches, float* d_clean_patches, int* timesteps, int batch_size) {
     int total_elements = batch_size * NUM_PATCHES * PATCH_DIM;
     
     // Generate noise
@@ -249,7 +249,7 @@ void forward_diffusion(DiffusionModel* model, float* d_noisy_patches, float* d_c
 }
 
 // Forward pass through diffusion model
-void forward_pass_diffusion(DiffusionModel* model, float* d_patches, int* timesteps) {
+void forward_pass_diffusion(SIM* model, float* d_patches, int* timesteps) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     
@@ -306,7 +306,7 @@ __global__ static void mse_loss_kernel(float* loss_result, float* pred_noise, fl
     }
 }
 
-float calculate_loss_diffusion(DiffusionModel* model, float* d_target_noise) {
+float calculate_loss_diffusion(SIM* model, float* d_target_noise) {
     int total_elements = model->batch_size * NUM_PATCHES * PATCH_DIM;
     int block_size = 256;
     int num_blocks = (total_elements + block_size - 1) / block_size;
@@ -322,7 +322,7 @@ float calculate_loss_diffusion(DiffusionModel* model, float* d_target_noise) {
 }
 
 // Zero gradients
-void zero_gradients_diffusion(DiffusionModel* model) {
+void zero_gradients_diffusion(SIM* model) {
     int patch_proj_size = PATCH_DIM * model->d_model;
     int time_emb_size = MAX_TIMESTEPS * model->d_model;
     
@@ -333,7 +333,7 @@ void zero_gradients_diffusion(DiffusionModel* model) {
 }
 
 // Backward pass (simplified)
-void backward_pass_diffusion(DiffusionModel* model, float* d_patches, int* timesteps) {
+void backward_pass_diffusion(SIM* model, float* d_patches, int* timesteps) {
     // This is a simplified backward pass - in practice you'd need full backprop
     // For now, just call transformer backward pass
     backward_pass_transformer(model->transformer, model->d_input_embeds, model->d_input_embeds);
@@ -355,7 +355,7 @@ __global__ static void adamw_update_kernel_diffusion(float* weight, float* grad,
     }
 }
 
-void update_weights_diffusion(DiffusionModel* model, float learning_rate) {
+void update_weights_diffusion(SIM* model, float learning_rate) {
     model->t++;
     
     float beta1_t = powf(model->beta1, model->t);

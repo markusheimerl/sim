@@ -91,31 +91,31 @@ typedef struct {
     int num_layers;
     int batch_size;
     int seq_len;  // NUM_PATCHES + 1 (for time embedding)
-} DiffusionModel;
+} SIM;
 
 // Function prototypes
-DiffusionModel* init_diffusion_model(int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle);
-void free_diffusion_model(DiffusionModel* model);
+SIM* init_diffusion_model(int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle);
+void free_diffusion_model(SIM* model);
 
 // Core diffusion operations
 void image_to_patches(float* d_patches, float* d_images, int batch_size);
 void patches_to_image(float* d_images, float* d_patches, int batch_size);
-void forward_diffusion(DiffusionModel* model, float* d_noisy_patches, float* d_clean_patches, int* timesteps, int batch_size);
-void reverse_diffusion_step(DiffusionModel* model, float* d_patches, int timestep, int batch_size);
+void forward_diffusion(SIM* model, float* d_noisy_patches, float* d_clean_patches, int* timesteps, int batch_size);
+void reverse_diffusion_step(SIM* model, float* d_patches, int timestep, int batch_size);
 
 // Training operations
-void forward_pass_diffusion(DiffusionModel* model, float* d_patches, int* timesteps);
-float calculate_loss_diffusion(DiffusionModel* model, float* d_target_noise);
-void zero_gradients_diffusion(DiffusionModel* model);
-void backward_pass_diffusion(DiffusionModel* model, float* d_patches, int* timesteps);
-void update_weights_diffusion(DiffusionModel* model, float learning_rate);
+void forward_pass_diffusion(SIM* model, float* d_patches, int* timesteps);
+float calculate_loss_diffusion(SIM* model, float* d_target_noise);
+void zero_gradients_diffusion(SIM* model);
+void backward_pass_diffusion(SIM* model, float* d_patches, int* timesteps);
+void update_weights_diffusion(SIM* model, float learning_rate);
 
 // Sampling
-void sample_images(DiffusionModel* model, float* d_output_images, int batch_size);
+void sample_images(SIM* model, float* d_output_images, int batch_size);
 
 // Utility functions
-void save_diffusion_model(DiffusionModel* model, const char* filename);
-DiffusionModel* load_diffusion_model(const char* filename, int custom_batch_size, cublasLtHandle_t cublaslt_handle);
+void save_diffusion_model(SIM* model, const char* filename);
+SIM* load_diffusion_model(const char* filename, int custom_batch_size, cublasLtHandle_t cublaslt_handle);
 void cifar10_to_float(float* output, const CIFAR10_Image* images, int num_images);
 
 #endif
