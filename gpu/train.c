@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <time.h>
 #include <signal.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include "sim.h"
 
@@ -22,24 +21,16 @@ void handle_sigint(int sig) {
 void cifar10_to_float(float* output, const CIFAR10_Image* images, int num_images) {
     for (int i = 0; i < num_images; i++) {
         for (int p = 0; p < 32 * 32; p++) {
-            // Convert CIFAR format (R[1024], G[1024], B[1024]) to interleaved RGB normalized to [-1,1]
             int out_idx = i * (32 * 32 * 3) + p * 3;
-            output[out_idx + 0] = (images[i].pixels[p] / 127.5f) - 1.0f;              // R
-            output[out_idx + 1] = (images[i].pixels[p + 32*32] / 127.5f) - 1.0f;      // G
-            output[out_idx + 2] = (images[i].pixels[p + 32*32*2] / 127.5f) - 1.0f;    // B
+            // Normalize to [-1, 1]
+            output[out_idx + 0] = (images[i].pixels[p] / 127.5f) - 1.0f;
+            output[out_idx + 1] = (images[i].pixels[p + 32*32] / 127.5f) - 1.0f;
+            output[out_idx + 2] = (images[i].pixels[p + 32*32*2] / 127.5f) - 1.0f;
         }
     }
 }
 
-void save_sample_image(float* d_output_patches, int sample_idx, const char* prefix) {
-    // Copy patches back to host
-    float* h_patches = (float*)malloc(NUM_PATCHES * PATCH_DIM * sizeof(float));
-    CHECK_CUDA(cudaMemcpy(h_patches, d_output_patches, NUM_PATCHES * PATCH_DIM * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // Convert patches to image
-    CIFAR10_Image sample_img;
-    sample_img.label = 0;  // Unknown class for generated images
-    
+void patches_to_image(float* patches, CIFAR10_Image* image, int sample_idx) {
     for (int patch_idx = 0; patch_idx < NUM_PATCHES; patch_idx++) {
         int patch_row = patch_idx / PATCHES_PER_ROW;
         int patch_col = patch_idx % PATCHES_PER_ROW;
@@ -54,19 +45,47 @@ void save_sample_image(float* d_output_patches, int sample_idx, const char* pref
             int global_row = patch_row * PATCH_SIZE + pixel_row;
             int global_col = patch_col * PATCH_SIZE + pixel_col;
             
-            float val = (h_patches[patch_idx * PATCH_DIM + pixel_in_patch] + 1.0f) * 127.5f;
+            // Denormalize from [-1, 1] to [0, 255]
+            float val = (patches[sample_idx * NUM_PATCHES * PATCH_DIM + patch_idx * PATCH_DIM + pixel_in_patch] + 1.0f) * 127.5f;
             val = fmaxf(0.0f, fminf(255.0f, val));
             
-            // CIFAR format: R[1024], G[1024], B[1024]
-            sample_img.pixels[channel * 32 * 32 + global_row * 32 + global_col] = (uint8_t)val;
+            image->pixels[channel * 32 * 32 + global_row * 32 + global_col] = (uint8_t)val;
         }
     }
+    image->label = 0;
+}
+
+void save_sample_images(SIM* sim, int epoch, int batch) {
+    // Copy patches back to host
+    int patch_buffer_size = sim->batch_size * NUM_PATCHES * PATCH_DIM;
+    float* h_clean = (float*)malloc(patch_buffer_size * sizeof(float));
+    float* h_noisy = (float*)malloc(patch_buffer_size * sizeof(float));
+    float* h_denoised = (float*)malloc(patch_buffer_size * sizeof(float));
+    
+    CHECK_CUDA(cudaMemcpy(h_clean, sim->d_clean_patches, patch_buffer_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_noisy, sim->d_noisy_patches, patch_buffer_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_denoised, sim->output_mlp->d_layer_output, patch_buffer_size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Save first sample from batch
+    CIFAR10_Image clean_img, noisy_img, denoised_img;
+    
+    patches_to_image(h_clean, &clean_img, 0);
+    patches_to_image(h_noisy, &noisy_img, 0);
+    patches_to_image(h_denoised, &denoised_img, 0);
     
     char filename[256];
-    snprintf(filename, sizeof(filename), "sample_images/%s_sample_%d.png", prefix, sample_idx);
-    save_cifar10_image_png(&sample_img, filename);
+    snprintf(filename, sizeof(filename), "sample_images/epoch_%d_batch_%d_clean.png", epoch, batch);
+    save_cifar10_image_png(&clean_img, filename);
     
-    free(h_patches);
+    snprintf(filename, sizeof(filename), "sample_images/epoch_%d_batch_%d_noisy.png", epoch, batch);
+    save_cifar10_image_png(&noisy_img, filename);
+    
+    snprintf(filename, sizeof(filename), "sample_images/epoch_%d_batch_%d_pred.png", epoch, batch);
+    save_cifar10_image_png(&denoised_img, filename);
+    
+    free(h_clean);
+    free(h_noisy);
+    free(h_denoised);
 }
 
 int main(void) {
@@ -79,13 +98,12 @@ int main(void) {
 
     const int d_model = 256;
     const int hidden_dim = 512;
-    const int num_layers = 6;
+    const int num_layers = 4;
     const int batch_size = 8;
-    const char* cifar_path = "../cifar-10-data/data_batch_1.bin";
+    const char* cifar_path = "../cifar-10-batches-bin/data_batch_1.bin";
     
     // Create output directory
     struct stat st;
-    memset(&st, 0, sizeof(st));
     if (stat("sample_images", &st) == -1) {
         mkdir("sample_images", 0755);
     }
@@ -101,40 +119,33 @@ int main(void) {
     // Initialize SIM
     sim = init_sim(d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
     
-    printf("Small Image Model (SIM) initialized:\n");
-    printf("  Patch size: %dx%d\n", PATCH_SIZE, PATCH_SIZE);
-    printf("  Number of patches: %d\n", NUM_PATCHES);
-    printf("  Patch dimension: %d\n", PATCH_DIM);
-    printf("  Model dimension: %d\n", d_model);
-    printf("  Transformer sequence length: %d (patches only)\n", NUM_PATCHES);
+    printf("SIM initialized:\n");
+    printf("  Patch size: %dx%d, Patches: %d, Patch dim: %d\n", PATCH_SIZE, PATCH_SIZE, NUM_PATCHES, PATCH_DIM);
+    printf("  Model dim: %d, Layers: %d\n", d_model, num_layers);
     
     // Training parameters
-    const int num_epochs = 20;
-    const float learning_rate = 0.0001f;
+    const int num_epochs = 10;
+    const float learning_rate = 0.0002f;
     const int num_batches = dataset->num_images / batch_size;
     
-    // Allocate device memory for training
+    // Allocate memory
     float* d_images;
     CHECK_CUDA(cudaMalloc(&d_images, batch_size * 32 * 32 * 3 * sizeof(float)));
-    
-    // Allocate host memory for batch
     float* h_images = (float*)malloc(batch_size * 32 * 32 * 3 * sizeof(float));
     
     printf("\nStarting training...\n");
     
     for (int epoch = 0; epoch < num_epochs; epoch++) {
         float epoch_loss = 0.0f;
-        int batches_processed = 0;
         
         for (int batch = 0; batch < num_batches; batch++) {
-            // Prepare batch data
+            // Prepare batch
             cifar10_to_float(h_images, &dataset->images[batch * batch_size], batch_size);
-            
-            // Copy to device
             CHECK_CUDA(cudaMemcpy(d_images, h_images, batch_size * 32 * 32 * 3 * sizeof(float), cudaMemcpyHostToDevice));
             
-            // Random timestep
-            int timestep = rand() % MAX_TIMESTEPS;
+            // Random timestep (more early timesteps for stable training)
+            int timestep = (int)(powf((float)rand() / RAND_MAX, 2.0f) * MAX_TIMESTEPS);
+            timestep = fminf(timestep, MAX_TIMESTEPS - 1);
             
             // Forward pass
             forward_pass_sim(sim, d_images, timestep);
@@ -142,38 +153,30 @@ int main(void) {
             // Calculate loss
             float loss = calculate_loss_sim(sim);
             epoch_loss += loss;
-            batches_processed++;
             
-            // Backward pass and update
+            // Backward pass
             zero_gradients_sim(sim);
             backward_pass_sim(sim, timestep);
             update_weights_sim(sim, learning_rate);
             
-            // Print progress every 100 batches
-            if (batch % 100 == 0) {
-                printf("Epoch [%d/%d], Batch [%d/%d], Timestep [%d], Loss: %.6f\n", 
+            // Print progress
+            if (batch % 200 == 0) {
+                printf("Epoch [%d/%d], Batch [%d/%d], Timestep [%d], Loss: %.6f\n",
                        epoch + 1, num_epochs, batch + 1, num_batches, timestep, loss);
             }
             
-            // Save sample every 200 batches
-            if (batch % 200 == 0 && batch > 0) {
-                printf("Saving training samples...\n");
-                save_sample_image(sim->output_mlp->d_layer_output, batch, "denoised");
-                
-                // Also save the original and noisy versions for comparison
-                save_sample_image(sim->d_patches, batch, "original");
-                save_sample_image(sim->d_noisy_patches, batch, "noisy");
+            // Save samples
+            if (batch % 400 == 0 && batch > 0) {
+                save_sample_images(sim, epoch, batch);
             }
         }
         
-        epoch_loss /= batches_processed;
+        epoch_loss /= num_batches;
         printf("Epoch [%d/%d] completed, Average Loss: %.6f\n", epoch + 1, num_epochs, epoch_loss);
         
-        // Save checkpoint every few epochs
-        if ((epoch + 1) % 5 == 0) {
-            char checkpoint_filename[64];
-            snprintf(checkpoint_filename, sizeof(checkpoint_filename), "checkpoint_sim.bin");
-            save_sim(sim, checkpoint_filename);
+        // Save checkpoint
+        if ((epoch + 1) % 3 == 0) {
+            save_sim(sim, "checkpoint_sim.bin");
             printf("Checkpoint saved\n");
         }
     }
