@@ -85,5 +85,6 @@ void backward_pass_sim(SIM* sim, int timestep);
 void update_weights_sim(SIM* sim, float learning_rate);
 void save_sim(SIM* sim, const char* filename);
 SIM* load_sim(const char* filename, int custom_batch_size, cublasLtHandle_t cublaslt_handle);
+void generate_images_sim(SIM* sim, float* d_generated_images, int num_samples, int num_inference_steps);
 
 #endif

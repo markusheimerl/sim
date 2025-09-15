@@ -13,7 +13,7 @@ void handle_sigint(int sig) {
         char model_filename[64];
         time_t now = time(NULL);
         strftime(model_filename, sizeof(model_filename), "%Y%m%d_%H%M%S_sim.bin", localtime(&now));
-        save_sim(sim, model_filename);
+        //save_sim(sim, model_filename);
     }
     exit(0);
 }
@@ -88,6 +88,67 @@ void save_sample_images(SIM* sim, int epoch, int batch) {
     free(h_denoised);
 }
 
+void generate_and_save_samples(SIM* sim, int epoch) {
+    const int num_gen_samples = 4;
+    const int num_inference_steps = 50;
+    
+    printf("\n=== Generating %d sample images at epoch %d ===\n", num_gen_samples, epoch);
+    
+    // Allocate memory for generated images
+    float* d_generated_images;
+    CHECK_CUDA(cudaMalloc(&d_generated_images, num_gen_samples * 32 * 32 * 3 * sizeof(float)));
+    
+    // Generate images
+    generate_images_sim(sim, d_generated_images, num_gen_samples, num_inference_steps);
+    
+    // Copy to host
+    float* h_generated_images = (float*)malloc(num_gen_samples * 32 * 32 * 3 * sizeof(float));
+    CHECK_CUDA(cudaMemcpy(h_generated_images, d_generated_images, 
+                         num_gen_samples * 32 * 32 * 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Debug: Print some pixel values
+    printf("Sample pixel values: [%.3f, %.3f, %.3f, %.3f, %.3f]\n", 
+           h_generated_images[0], h_generated_images[1], h_generated_images[2], 
+           h_generated_images[3], h_generated_images[4]);
+    
+    // Convert to CIFAR format and save
+    for (int i = 0; i < num_gen_samples; i++) {
+        CIFAR10_Image generated_img;
+        
+        // Convert from interleaved RGB to CIFAR format
+        for (int y = 0; y < 32; y++) {
+            for (int x = 0; x < 32; x++) {
+                int pixel_idx = y * 32 + x;
+                int rgb_idx = i * (32 * 32 * 3) + pixel_idx * 3;
+                
+                // Clamp to [-1, 1] range first
+                float r = fmaxf(-1.0f, fminf(1.0f, h_generated_images[rgb_idx + 0]));
+                float g = fmaxf(-1.0f, fminf(1.0f, h_generated_images[rgb_idx + 1]));
+                float b = fmaxf(-1.0f, fminf(1.0f, h_generated_images[rgb_idx + 2]));
+                
+                // Convert to [0, 255]
+                generated_img.pixels[pixel_idx] = (uint8_t)((r + 1.0f) * 127.5f);
+                generated_img.pixels[pixel_idx + 32*32] = (uint8_t)((g + 1.0f) * 127.5f);
+                generated_img.pixels[pixel_idx + 32*32*2] = (uint8_t)((b + 1.0f) * 127.5f);
+            }
+        }
+        
+        generated_img.label = 0;
+        
+        char filename[256];
+        snprintf(filename, sizeof(filename), "sample_images/generated_epoch_%d_sample_%d.png", epoch, i);
+        save_cifar10_image_png(&generated_img, filename);
+        
+        printf("Saved: %s\n", filename);
+    }
+    
+    printf("Image generation completed!\n\n");
+    
+    // Cleanup
+    free(h_generated_images);
+    CHECK_CUDA(cudaFree(d_generated_images));
+}
+
 int main(void) {
     srand(time(NULL));
     signal(SIGINT, handle_sigint);
@@ -96,10 +157,10 @@ int main(void) {
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
 
-    const int d_model = 256;
-    const int hidden_dim = 512;
-    const int num_layers = 4;
-    const int batch_size = 8;
+    const int d_model = 512;
+    const int hidden_dim = 2048;
+    const int num_layers = 8;
+    const int batch_size = 32;
     const char* cifar_path = "../cifar-10-batches-bin/data_batch_1.bin";
     
     // Create output directory
@@ -124,8 +185,8 @@ int main(void) {
     printf("  Model dim: %d, Layers: %d\n", d_model, num_layers);
     
     // Training parameters
-    const int num_epochs = 10;
-    const float learning_rate = 0.0002f;
+    const int num_epochs = 1000;
+    const float learning_rate = 0.0001f;
     const int num_batches = dataset->num_images / batch_size;
     
     // Allocate memory
@@ -144,7 +205,7 @@ int main(void) {
             CHECK_CUDA(cudaMemcpy(d_images, h_images, batch_size * 32 * 32 * 3 * sizeof(float), cudaMemcpyHostToDevice));
             
             // Random timestep (more early timesteps for stable training)
-            int timestep = (int)(powf((float)rand() / RAND_MAX, 2.0f) * MAX_TIMESTEPS);
+            int timestep = (int)(powf((float)rand() / (float)RAND_MAX, 2.0f) * MAX_TIMESTEPS);
             timestep = fminf(timestep, MAX_TIMESTEPS - 1);
             
             // Forward pass
@@ -160,12 +221,12 @@ int main(void) {
             update_weights_sim(sim, learning_rate);
             
             // Print progress
-            if (batch % 200 == 0) {
+            if (batch % 2 == 0) {
                 printf("Epoch [%d/%d], Batch [%d/%d], Timestep [%d], Loss: %.6f\n",
                        epoch + 1, num_epochs, batch + 1, num_batches, timestep, loss);
             }
             
-            // Save samples
+            // Save training samples
             if (batch % 400 == 0 && batch > 0) {
                 save_sample_images(sim, epoch, batch);
             }
@@ -173,6 +234,11 @@ int main(void) {
         
         epoch_loss /= num_batches;
         printf("Epoch [%d/%d] completed, Average Loss: %.6f\n", epoch + 1, num_epochs, epoch_loss);
+        
+        // Generate sample images every 2 epochs
+        if ((epoch + 1) % 2 == 0) {
+            generate_and_save_samples(sim, epoch + 1);
+        }
         
         // Save checkpoint
         if ((epoch + 1) % 3 == 0) {
@@ -188,6 +254,9 @@ int main(void) {
     time_t now = time(NULL);
     strftime(model_filename, sizeof(model_filename), "%Y%m%d_%H%M%S_sim.bin", localtime(&now));
     save_sim(sim, model_filename);
+    
+    // Final generation
+    generate_and_save_samples(sim, num_epochs);
     
     // Cleanup
     free(h_images);

@@ -1,5 +1,6 @@
 #include "sim.h"
 
+
 // Initialize curand states
 __global__ static void init_curand_states(curandState* states, unsigned long seed, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -127,6 +128,164 @@ __global__ static void adamw_update_kernel(float* weight, float* grad, float* m,
         float update = alpha_t * m[idx] / (sqrtf(v[idx]) + epsilon);
         weight[idx] = weight[idx] * (1.0f - learning_rate * weight_decay) - update;
     }
+}
+
+
+// CUDA kernel to subtract predicted noise from current state (CORRECTED)
+__global__ static void denoise_step_kernel(float* current_patches, float* predicted_noise, 
+                                          float sqrt_alpha, float sqrt_alpha_prev, 
+                                          float beta_over_sqrt_one_minus_alpha, int total_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        // DDPM denoising formula: x_{t-1} = (1/√α_t) * (x_t - (β_t/√(1-ᾱ_t)) * ε_θ(x_t, t))
+        current_patches[idx] = (1.0f / sqrt_alpha) * (current_patches[idx] - beta_over_sqrt_one_minus_alpha * predicted_noise[idx]);
+    }
+}
+
+// CUDA kernel to add controlled noise for stochastic sampling
+__global__ static void add_stochastic_noise_kernel(float* patches, curandState* states, float noise_variance, int total_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        if (noise_variance > 0.0f) {
+            patches[idx] += sqrtf(noise_variance) * curand_normal(&states[idx % 65536]);
+        }
+    }
+}
+
+// Convert patches back to images (CORRECTED)
+__global__ static void patches_to_image_kernel(float* images, float* patches, int batch_size) {
+    int b = blockIdx.x;
+    int patch_idx = blockIdx.y;
+    int pixel_in_patch = threadIdx.x;
+    
+    if (b >= batch_size || patch_idx >= NUM_PATCHES || pixel_in_patch >= PATCH_DIM) return;
+    
+    int patch_row = patch_idx / PATCHES_PER_ROW;
+    int patch_col = patch_idx % PATCHES_PER_ROW;
+    
+    int pixel_idx = pixel_in_patch / 3;
+    int channel = pixel_in_patch % 3;
+    int pixel_row = pixel_idx / PATCH_SIZE;
+    int pixel_col = pixel_idx % PATCH_SIZE;
+    
+    int global_row = patch_row * PATCH_SIZE + pixel_row;
+    int global_col = patch_col * PATCH_SIZE + pixel_col;
+    
+    int img_idx = b * (32 * 32 * 3) + (global_row * 32 + global_col) * 3 + channel;
+    int patch_input_idx = b * NUM_PATCHES * PATCH_DIM + patch_idx * PATCH_DIM + pixel_in_patch;
+    
+    images[img_idx] = patches[patch_input_idx];
+}
+
+// CORRECTED: Generate new images using proper reverse diffusion
+void generate_images_sim(SIM* sim, float* d_generated_images, int num_samples, int num_inference_steps) {
+    printf("Starting generation: %d samples, %d steps\n", num_samples, num_inference_steps);
+    
+    // Allocate temporary buffers
+    int patch_buffer_size = num_samples * NUM_PATCHES * PATCH_DIM;
+    int patch_embed_size = num_samples * NUM_PATCHES * sim->d_model;
+    
+    float* d_current_patches;
+    float* d_temp_patch_embeds;
+    
+    CHECK_CUDA(cudaMalloc(&d_current_patches, patch_buffer_size * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_temp_patch_embeds, patch_embed_size * sizeof(float)));
+    
+    // Start with pure noise (standard normal distribution)
+    int block_size = 256;
+    int num_blocks = (patch_buffer_size + block_size - 1) / block_size;
+    generate_noise_kernel<<<num_blocks, block_size>>>(d_current_patches, sim->d_curand_states, patch_buffer_size);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    
+    // Reverse diffusion process
+    for (int step = 0; step < num_inference_steps; step++) {
+        // Map step to timestep: start from high noise (MAX_TIMESTEPS-1) to low noise (0)
+        int timestep = (int)((float)(num_inference_steps - step - 1) / (float)(num_inference_steps - 1) * (MAX_TIMESTEPS - 1));
+        timestep = fmaxf(0, fminf(MAX_TIMESTEPS - 1, timestep));
+        
+        // === FORWARD PASS TO PREDICT NOISE ===
+        
+        // Store original batch sizes
+        int orig_input_batch = sim->input_mlp->batch_size;
+        int orig_transformer_batch = sim->transformer->batch_size;  
+        int orig_output_batch = sim->output_mlp->batch_size;
+        
+        // Temporarily adjust batch sizes
+        sim->input_mlp->batch_size = num_samples * NUM_PATCHES;
+        sim->transformer->batch_size = num_samples;
+        sim->output_mlp->batch_size = num_samples * NUM_PATCHES;
+        
+        // Project patches to d_model
+        forward_pass_mlp(sim->input_mlp, d_current_patches);
+        CHECK_CUDA(cudaMemcpy(d_temp_patch_embeds, sim->input_mlp->d_layer_output,
+                             patch_embed_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        
+        // Add position encoding
+        dim3 grid_pos(num_samples, NUM_PATCHES);
+        dim3 block_pos(sim->d_model);
+        add_position_encoding_kernel<<<grid_pos, block_pos>>>(d_temp_patch_embeds, num_samples, NUM_PATCHES, sim->d_model);
+        
+        // Add time embedding
+        dim3 grid_time(num_samples, NUM_PATCHES);  
+        dim3 block_time(sim->d_model);
+        add_time_embedding_kernel<<<grid_time, block_time>>>(d_temp_patch_embeds, sim->d_time_embedding,
+                                                             timestep, num_samples, sim->d_model);
+        
+        // Transformer forward pass
+        forward_pass_transformer(sim->transformer, d_temp_patch_embeds);
+        
+        // Project back to patch dimension (this gives us predicted noise)
+        forward_pass_mlp(sim->output_mlp, sim->transformer->mlp_layers[sim->num_layers-1]->d_layer_output);
+        
+        // Restore original batch sizes
+        sim->input_mlp->batch_size = orig_input_batch;
+        sim->transformer->batch_size = orig_transformer_batch;
+        sim->output_mlp->batch_size = orig_output_batch;
+        
+        // === DENOISING STEP ===
+        if (timestep > 0) {
+            // Get noise schedule values
+            float alpha_t = 1.0f - (MIN_BETA + (MAX_BETA - MIN_BETA) * timestep / (MAX_TIMESTEPS - 1));
+            float alpha_bar_t = sim->h_alpha_bars[timestep];
+            float alpha_bar_t_prev = (timestep > 0) ? sim->h_alpha_bars[timestep - 1] : 1.0f;
+            
+            float sqrt_alpha_t = sqrtf(alpha_t);
+            float beta_t = 1.0f - alpha_t;
+            float sqrt_one_minus_alpha_bar_t = sqrtf(1.0f - alpha_bar_t);
+            
+            // Denoise: x_{t-1} = (1/√α_t) * (x_t - (β_t/√(1-ᾱ_t)) * ε_θ(x_t, t))
+            denoise_step_kernel<<<num_blocks, block_size>>>(
+                d_current_patches, sim->output_mlp->d_layer_output,
+                sqrt_alpha_t, sqrtf(alpha_bar_t_prev), 
+                beta_t / sqrt_one_minus_alpha_bar_t, patch_buffer_size);
+            
+            // Add stochastic noise (except for last step)
+            if (step < num_inference_steps - 1) {
+                float noise_variance = (1.0f - alpha_bar_t_prev) / (1.0f - alpha_bar_t) * beta_t;
+                add_stochastic_noise_kernel<<<num_blocks, block_size>>>(
+                    d_current_patches, sim->d_curand_states, noise_variance * 0.1f, patch_buffer_size);
+            }
+        }
+        
+        CHECK_CUDA(cudaDeviceSynchronize());
+        
+        // Print progress
+        if (step % (num_inference_steps / 5) == 0 || step == num_inference_steps - 1) {
+            printf("  Step %d/%d (timestep %d)\n", step + 1, num_inference_steps, timestep);
+        }
+    }
+    
+    // Convert final patches back to full images
+    dim3 grid_convert(num_samples, NUM_PATCHES);
+    dim3 block_convert(PATCH_DIM);
+    patches_to_image_kernel<<<grid_convert, block_convert>>>(d_generated_images, d_current_patches, num_samples);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    
+    // Cleanup temporary buffers
+    CHECK_CUDA(cudaFree(d_current_patches));
+    CHECK_CUDA(cudaFree(d_temp_patch_embeds));
+    
+    printf("Generation completed!\n");
 }
 
 SIM* init_sim(int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
