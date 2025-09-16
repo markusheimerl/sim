@@ -1,147 +1,122 @@
 #include "data.h"
 
-const char* CIFAR10_CLASS_NAMES[10] = {
-    "airplane", "automobile", "bird", "cat", "deer",
-    "dog", "frog", "horse", "ship", "truck"
-};
+static uint32_t read_big_endian_uint32(FILE* file) {
+    uint32_t val;
+    fread(&val, sizeof(uint32_t), 1, file);
+    return ((val & 0xFF) << 24) | (((val >> 8) & 0xFF) << 16) | 
+           (((val >> 16) & 0xFF) << 8) | ((val >> 24) & 0xFF);
+}
 
-CIFAR10_Dataset* load_cifar10_batch(const char* filename) {
+void load_mnist_data(float** X, int* num_samples, const char* filename) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
-        printf("Error: Could not open CIFAR-10 batch file: %s\n", filename);
-        return NULL;
+        printf("Error: Could not open MNIST file: %s\n", filename);
+        *X = NULL;
+        *num_samples = 0;
+        return;
     }
-
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    long expected_size = CIFAR10_IMAGES_PER_BATCH * CIFAR10_RECORD_SIZE;
-    if (file_size != expected_size) {
-        printf("Error: Invalid CIFAR-10 batch file size. Expected %ld, got %ld\n", 
-               expected_size, file_size);
+    
+    uint32_t magic, num_imgs, rows, cols;
+    magic = read_big_endian_uint32(file);
+    num_imgs = read_big_endian_uint32(file);
+    rows = read_big_endian_uint32(file);
+    cols = read_big_endian_uint32(file);
+    
+    if (magic != 0x00000803 || rows != 28 || cols != 28) {
+        printf("Error: Invalid MNIST file format\n");
         fclose(file);
-        return NULL;
+        *X = NULL;
+        *num_samples = 0;
+        return;
     }
-
-    CIFAR10_Dataset* dataset = (CIFAR10_Dataset*)malloc(sizeof(CIFAR10_Dataset));
-    dataset->images = (CIFAR10_Image*)malloc(CIFAR10_IMAGES_PER_BATCH * sizeof(CIFAR10_Image));
-    dataset->num_images = CIFAR10_IMAGES_PER_BATCH;
-    dataset->capacity = CIFAR10_IMAGES_PER_BATCH;
-
-    for (int i = 0; i < CIFAR10_IMAGES_PER_BATCH; i++) {
-        if (fread(&dataset->images[i].label, 1, 1, file) != 1) {
-            printf("Error reading label for image %d\n", i);
-            free_cifar10_dataset(dataset);
-            fclose(file);
-            return NULL;
-        }
-
-        if (fread(dataset->images[i].pixels, 1, CIFAR10_TOTAL_PIXELS, file) != CIFAR10_TOTAL_PIXELS) {
-            printf("Error reading pixel data for image %d\n", i);
-            free_cifar10_dataset(dataset);
-            fclose(file);
-            return NULL;
-        }
+    
+    uint8_t* raw_images = (uint8_t*)malloc(num_imgs * 28 * 28 * sizeof(uint8_t));
+    fread(raw_images, sizeof(uint8_t), num_imgs * 28 * 28, file);
+    
+    // Convert to float [-1, 1] range
+    *X = (float*)malloc(num_imgs * 28 * 28 * sizeof(float));
+    for (int i = 0; i < (int)(num_imgs * 28 * 28); i++) {
+        (*X)[i] = (raw_images[i] / 127.5f) - 1.0f;
     }
-
+    
+    free(raw_images);
     fclose(file);
-    printf("Loaded CIFAR-10 batch: %s (%d images)\n", filename, CIFAR10_IMAGES_PER_BATCH);
-    return dataset;
+    
+    *num_samples = (int)num_imgs;
+    printf("Loaded MNIST data: %d samples (28x28)\n", *num_samples);
 }
 
-void free_cifar10_dataset(CIFAR10_Dataset* dataset) {
-    if (dataset) {
-        if (dataset->images) {
-            free(dataset->images);
-        }
-        free(dataset);
+void save_data(float* X, int num_samples, int input_dim, const char* filename) {
+    FILE* f = fopen(filename, "w");
+    if (!f) { 
+        printf("Error: cannot write %s\n", filename); 
+        return; 
     }
-}
-
-void convert_cifar10_to_rgb(const CIFAR10_Image* cifar_img, uint8_t* rgb_output) {
-    for (int y = 0; y < CIFAR10_IMAGE_SIZE; y++) {
-        for (int x = 0; x < CIFAR10_IMAGE_SIZE; x++) {
-            int pixel_idx = y * CIFAR10_IMAGE_SIZE + x;
-            int rgb_idx = pixel_idx * 3;
-            
-            rgb_output[rgb_idx + 0] = cifar_img->pixels[pixel_idx];
-            rgb_output[rgb_idx + 1] = cifar_img->pixels[pixel_idx + CIFAR10_PIXELS];
-            rgb_output[rgb_idx + 2] = cifar_img->pixels[pixel_idx + 2 * CIFAR10_PIXELS];
+    
+    // Header
+    for (int i = 0; i < input_dim; i++) {
+        fprintf(f, "pixel%d%s", i, i == input_dim-1 ? "\n" : ",");
+    }
+    
+    // Data
+    for (int s = 0; s < num_samples; s++) {
+        for (int i = 0; i < input_dim; i++) {
+            fprintf(f, "%.6f%s", X[s * input_dim + i], i == input_dim-1 ? "\n" : ",");
         }
     }
+    
+    fclose(f);
+    printf("Data saved to %s\n", filename);
 }
 
-int save_cifar10_image_png(const CIFAR10_Image* image, const char* filename) {
+void save_mnist_image_png(float* image_data, const char* filename) {
     FILE* fp = fopen(filename, "wb");
-    if (!fp) return 0;
+    if (!fp) return;
 
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png) {
         fclose(fp);
-        return 0;
+        return;
     }
 
     png_infop info = png_create_info_struct(png);
     if (!info) {
         png_destroy_write_struct(&png, NULL);
         fclose(fp);
-        return 0;
+        return;
     }
 
     if (setjmp(png_jmpbuf(png))) {
         png_destroy_write_struct(&png, &info);
         fclose(fp);
-        return 0;
-    }
-
-    png_init_io(png, fp);
-    png_set_IHDR(png, info, CIFAR10_IMAGE_SIZE, CIFAR10_IMAGE_SIZE, 8,
-                 PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
-                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-    png_write_info(png, info);
-
-    uint8_t* rgb_data = (uint8_t*)malloc(CIFAR10_TOTAL_PIXELS * sizeof(uint8_t));
-    convert_cifar10_to_rgb(image, rgb_data);
-
-    png_bytep* row_pointers = (png_bytep*)malloc(CIFAR10_IMAGE_SIZE * sizeof(png_bytep));
-    for (int y = 0; y < CIFAR10_IMAGE_SIZE; y++) {
-        row_pointers[y] = &rgb_data[y * CIFAR10_IMAGE_SIZE * 3];
-    }
-
-    png_write_image(png, row_pointers);
-    png_write_end(png, NULL);
-
-    free(row_pointers);
-    free(rgb_data);
-    png_destroy_write_struct(&png, &info);
-    fclose(fp);
-
-    return 1;
-}
-
-void print_cifar10_stats(const CIFAR10_Dataset* dataset) {
-    if (!dataset || !dataset->images) {
-        printf("Dataset is empty or null\n");
         return;
     }
 
-    int class_counts[10] = {0};
-    
-    for (int i = 0; i < dataset->num_images; i++) {
-        if (dataset->images[i].label < 10) {
-            class_counts[dataset->images[i].label]++;
+    png_init_io(png, fp);
+    png_set_IHDR(png, info, 28, 28, 8,
+                 PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    // Convert float data to uint8_t
+    uint8_t* row_data = (uint8_t*)malloc(28 * sizeof(uint8_t));
+    png_bytep* row_pointers = (png_bytep*)malloc(28 * sizeof(png_bytep));
+
+    for (int y = 0; y < 28; y++) {
+        for (int x = 0; x < 28; x++) {
+            // Clamp to [-1, 1] range first
+            float val = fmaxf(-1.0f, fminf(1.0f, image_data[y * 28 + x]));
+            // Convert to [0, 255]
+            row_data[x] = (uint8_t)((val + 1.0f) * 127.5f);
         }
+        row_pointers[y] = &row_data[0];
+        png_write_row(png, row_pointers[y]);
     }
 
-    printf("\nCIFAR-10 Dataset Statistics:\n");
-    printf("Total images: %d\n", dataset->num_images);
-    printf("Image size: %dx%d pixels, %d channels\n", 
-           CIFAR10_IMAGE_SIZE, CIFAR10_IMAGE_SIZE, CIFAR10_CHANNELS);
-    printf("\nClass distribution:\n");
-    
-    for (int i = 0; i < 10; i++) {
-        printf("  %d (%s): %d images\n", i, CIFAR10_CLASS_NAMES[i], class_counts[i]);
-    }
-    printf("\n");
+    png_write_end(png, NULL);
+
+    free(row_pointers);
+    free(row_data);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
 }
