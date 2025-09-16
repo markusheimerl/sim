@@ -58,3 +58,4 @@ dkms.conf
 *.tar.gz
 *-ubyte
 *.csv
+screenlog.0

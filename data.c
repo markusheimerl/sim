@@ -46,6 +46,36 @@ void load_mnist_data(float** X, int* num_samples, const char* filename) {
     printf("Loaded MNIST data: %d samples (28x28)\n", *num_samples);
 }
 
+void load_mnist_labels(unsigned char** labels, int* num_labels, const char* filename) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        printf("Error: Could not open MNIST labels file: %s\n", filename);
+        *labels = NULL;
+        *num_labels = 0;
+        return;
+    }
+    
+    uint32_t magic, num_items;
+    magic = read_big_endian_uint32(file);
+    num_items = read_big_endian_uint32(file);
+    
+    if (magic != 0x00000801) {
+        printf("Error: Invalid MNIST labels file format\n");
+        fclose(file);
+        *labels = NULL;
+        *num_labels = 0;
+        return;
+    }
+    
+    *labels = (unsigned char*)malloc(num_items * sizeof(unsigned char));
+    fread(*labels, sizeof(unsigned char), num_items, file);
+    
+    fclose(file);
+    
+    *num_labels = (int)num_items;
+    printf("Loaded MNIST labels: %d labels\n", *num_labels);
+}
+
 void save_data(float* X, int num_samples, int input_dim, const char* filename) {
     FILE* f = fopen(filename, "w");
     if (!f) { 

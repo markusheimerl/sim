@@ -8,6 +8,7 @@
 #include <png.h>
 
 void load_mnist_data(float** X, int* num_samples, const char* filename);
+void load_mnist_labels(unsigned char** labels, int* num_labels, const char* filename);
 void save_data(float* X, int num_samples, int input_dim, const char* filename);
 void save_mnist_image_png(float* image_data, const char* filename);
 

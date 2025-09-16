@@ -12,6 +12,7 @@ SIM* init_sim(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     sim->num_layers = num_layers;
     sim->vocab_size = 256;
     sim->image_size = 28; // MNIST images are 28x28
+    sim->num_classes = 10; // MNIST digits 0-9
     sim->cublaslt_handle = cublaslt_handle;
     
     // Initialize Adam parameters
@@ -101,8 +102,8 @@ __global__ static void token_embedding_lookup_kernel(float* embedded, float* tok
     embedded[emb_idx] = token_embedding[token * d_model + d];
 }
 
-// CUDA kernel for 2D positional encodings
-__global__ static void positional_encoding_2d_kernel(float* embedded, int batch_size, int seq_len, int d_model, int image_size) {
+// CUDA kernel for 2D positional encodings and class label conditioning
+__global__ static void positional_and_class_encoding_kernel(float* embedded, unsigned char* class_labels, int batch_size, int seq_len, int d_model, int image_size, int num_classes) {
     int b = blockIdx.x;
     int t = blockIdx.y;
     int d = threadIdx.x;
@@ -115,26 +116,41 @@ __global__ static void positional_encoding_2d_kernel(float* embedded, int batch_
     int row = t / image_size;
     int col = t % image_size;
     
-    float pos_encoding = 0.0f;
+    // Get class label for this batch element
+    int class_label = class_labels[b];
     
-    if (d < d_model / 2) {
-        // First half: row encoding
+    float encoding = 0.0f;
+    
+    // Split d_model into three parts: position (2/3), class (1/3)
+    int pos_dims = (2 * d_model) / 3;
+    int class_dims = d_model - pos_dims;
+    
+    if (d < pos_dims / 2) {
+        // First part: row encoding
         if (d % 2 == 0) {
-            pos_encoding = sinf(row / powf(10000.0f, (2.0f * (d / 2)) / (d_model / 2)));
+            encoding = sinf(row / powf(10000.0f, (2.0f * (d / 2)) / (pos_dims / 2)));
         } else {
-            pos_encoding = cosf(row / powf(10000.0f, (2.0f * ((d - 1) / 2)) / (d_model / 2)));
+            encoding = cosf(row / powf(10000.0f, (2.0f * ((d - 1) / 2)) / (pos_dims / 2)));
+        }
+    } else if (d < pos_dims) {
+        // Second part: column encoding
+        int d_col = d - pos_dims / 2;
+        if (d_col % 2 == 0) {
+            encoding = sinf(col / powf(10000.0f, (2.0f * (d_col / 2)) / (pos_dims / 2)));
+        } else {
+            encoding = cosf(col / powf(10000.0f, (2.0f * ((d_col - 1) / 2)) / (pos_dims / 2)));
         }
     } else {
-        // Second half: column encoding
-        int d_col = d - d_model / 2;
-        if (d_col % 2 == 0) {
-            pos_encoding = sinf(col / powf(10000.0f, (2.0f * (d_col / 2)) / (d_model / 2)));
+        // Third part: class label encoding
+        int d_class = d - pos_dims;
+        if (d_class % 2 == 0) {
+            encoding = sinf(class_label / powf(10000.0f, (2.0f * (d_class / 2)) / class_dims));
         } else {
-            pos_encoding = cosf(col / powf(10000.0f, (2.0f * ((d_col - 1) / 2)) / (d_model / 2)));
+            encoding = cosf(class_label / powf(10000.0f, (2.0f * ((d_class - 1) / 2)) / class_dims));
         }
     }
     
-    embedded[idx] += pos_encoding;
+    embedded[idx] += encoding;
 }
 
 // CUDA kernel for softmax and cross-entropy loss computation
@@ -194,7 +210,7 @@ __global__ static void token_embedding_grad_kernel(float* token_embedding_grad, 
 }
 
 // Forward pass
-void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
+void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens, unsigned char* d_class_labels) {
     // Step 1: Token embedding lookup
     dim3 grid_emb(sim->batch_size, sim->seq_len);
     dim3 block_emb(sim->d_model);
@@ -203,9 +219,9 @@ void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
         sim->batch_size, sim->seq_len, sim->d_model
     );
     
-    // Step 2: Add 2D positional encodings
-    positional_encoding_2d_kernel<<<grid_emb, block_emb>>>(
-        sim->d_embedded_input, sim->batch_size, sim->seq_len, sim->d_model, sim->image_size
+    // Step 2: Add 2D positional encodings and class label conditioning
+    positional_and_class_encoding_kernel<<<grid_emb, block_emb>>>(
+        sim->d_embedded_input, d_class_labels, sim->batch_size, sim->seq_len, sim->d_model, sim->image_size, sim->num_classes
     );
     
     // Step 3: Forward pass through transformer
@@ -245,7 +261,7 @@ void zero_gradients_sim(SIM* sim) {
 }
 
 // Backward pass
-void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
+void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens, unsigned char* d_class_labels) {
     // Step 4 (backward): Backward pass through output MLP
     backward_pass_mlp(sim->output_mlp, 
                       sim->transformer->mlp_layers[sim->num_layers-1]->d_layer_output, 
@@ -254,7 +270,7 @@ void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
     // Step 3 (backward): Backward pass through transformer
     backward_pass_transformer(sim->transformer, sim->d_embedded_input, sim->d_embedded_input);
     
-    // Step 2 (backward): Position encoding gradients pass through unchanged
+    // Step 2 (backward): Position and class encoding gradients pass through unchanged
     // (no learnable parameters, gradients flow through to token embeddings)
     
     // Step 1 (backward): Token embedding gradients
@@ -328,6 +344,7 @@ void save_sim(SIM* sim, const char* filename) {
     fwrite(&sim->num_layers, sizeof(int), 1, file);
     fwrite(&sim->vocab_size, sizeof(int), 1, file);
     fwrite(&sim->image_size, sizeof(int), 1, file);
+    fwrite(&sim->num_classes, sizeof(int), 1, file);
     
     int token_emb_size = sim->vocab_size * sim->d_model;
     
@@ -388,7 +405,7 @@ SIM* load_sim(const char* filename, int custom_batch_size, cublasLtHandle_t cubl
     }
     
     // Read dimensions
-    int seq_len, d_model, stored_batch_size, hidden_dim, num_layers, vocab_size, image_size;
+    int seq_len, d_model, stored_batch_size, hidden_dim, num_layers, vocab_size, image_size, num_classes;
     fread(&seq_len, sizeof(int), 1, file);
     fread(&d_model, sizeof(int), 1, file);
     fread(&stored_batch_size, sizeof(int), 1, file);
@@ -396,6 +413,7 @@ SIM* load_sim(const char* filename, int custom_batch_size, cublasLtHandle_t cubl
     fread(&num_layers, sizeof(int), 1, file);
     fread(&vocab_size, sizeof(int), 1, file);
     fread(&image_size, sizeof(int), 1, file);
+    fread(&num_classes, sizeof(int), 1, file);
     
     // Use custom_batch_size if provided, otherwise use stored value
     int batch_size = (custom_batch_size > 0) ? custom_batch_size : stored_batch_size;
