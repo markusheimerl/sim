@@ -21,103 +21,88 @@ void handle_sigint(int signum) {
     exit(128 + signum);
 }
 
-// Convert float image [-1,1] to unsigned char tokens [0,255]
-void float_to_tokens(float* image, unsigned char* tokens, int size) {
-    for (int i = 0; i < size; i++) {
-        // Clamp to [-1, 1] and convert to [0, 255]
-        float val = fmaxf(-1.0f, fminf(1.0f, image[i]));
-        tokens[i] = (unsigned char)((val + 1.0f) * 127.5f);
-    }
+// Kernel: x_t = sqrt(alpha_bar[t]) * x0 + sqrt(1 - alpha_bar[t]) * noise
+__global__ static void add_noise_kernel(float* x_t, const float* x0, const float* noise,
+                                        const float* sqrt_alpha_bar, const float* sqrt_one_minus_alpha_bar,
+                                        int t_idx, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    float a = sqrt_alpha_bar[t_idx];
+    float b = sqrt_one_minus_alpha_bar[t_idx];
+    x_t[i] = a * x0[i] + b * noise[i];
 }
 
-// Convert unsigned char tokens [0,255] back to float image [-1,1]
-void tokens_to_float(unsigned char* tokens, float* image, int size) {
-    for (int i = 0; i < size; i++) {
-        image[i] = (tokens[i] / 127.5f) - 1.0f;
-    }
+// Kernel: DDPM step
+// x_{t-1} = 1/sqrt(alpha_t) * ( x_t - (1 - alpha_t)/sqrt(1 - alpha_bar_t) * eps_hat ) + sqrt(beta_t) * z
+__global__ static void ddpm_step_kernel(float* x_prev, const float* x_t, const float* eps_hat, const float* z,
+                                        const float* alphas, const float* sqrt_one_minus_alpha_bar, const float* sqrt_recip_alphas, const float* sqrt_betas,
+                                        int t_idx, int total, int add_noise) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    
+    float alpha_t = alphas[t_idx];
+    float one_minus_alpha_t = 1.0f - alpha_t;
+    float coef = one_minus_alpha_t / sqrt_one_minus_alpha_bar[t_idx];
+    float term = sqrt_recip_alphas[t_idx] * (x_t[i] - coef * eps_hat[i]);
+    float noise = add_noise ? sqrt_betas[t_idx] * z[i] : 0.0f;
+    x_prev[i] = term + noise;
 }
 
-// Generate image function using autoregressive sampling with class conditioning
-void generate_image(SIM* sim, float* generated_image, float temperature, unsigned char* d_input_tokens, unsigned char target_class) {
-    const int image_pixels = 28 * 28;
+// Generate a single image via DDPM sampling, conditioned on class label
+static void generate_image(SIM* sim, float* generated_image, float temperature,
+                           unsigned char* d_class_labels, curandGenerator_t gen) {
+    (void)temperature; // kept for API compatibility; not used in DDPM sampling
     
-    // Start with all zeros (black image)
-    unsigned char* h_tokens = (unsigned char*)malloc(image_pixels * sizeof(unsigned char));
-    memset(h_tokens, 0, image_pixels * sizeof(unsigned char));
+    const int image_pixels = sim->seq_len;
+    const int total = sim->seq_len * sim->batch_size;
     
-    // Create class label array for batch (all same class)
-    unsigned char* h_class_labels = (unsigned char*)malloc(sim->batch_size * sizeof(unsigned char));
-    unsigned char* d_class_labels;
-    CHECK_CUDA(cudaMalloc(&d_class_labels, sim->batch_size * sizeof(unsigned char)));
+    // Working buffers
+    float* d_x;       // current x_t
+    float* d_x_prev;  // x_{t-1}
+    float* d_z;       // random normal
+    CHECK_CUDA(cudaMalloc(&d_x, sim->batch_size * sim->seq_len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_x_prev, sim->batch_size * sim->seq_len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_z, sim->batch_size * sim->seq_len * sizeof(float)));
     
-    for (int b = 0; b < sim->batch_size; b++) {
-        h_class_labels[b] = target_class;
-    }
-    CHECK_CUDA(cudaMemcpy(d_class_labels, h_class_labels, sim->batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    // Start from pure Gaussian noise
+    curandGenerateNormal(gen, d_x, sim->batch_size * sim->seq_len, 0.0f, 1.0f);
     
-    printf("Generating class %d image pixel by pixel...\n", target_class);
+    int block = 256;
+    int grid = (sim->batch_size * sim->seq_len + block - 1) / block;
     
-    // Allocate logits buffer on host
-    float* h_logits = (float*)malloc(sim->vocab_size * sizeof(float));
-    
-    // Generate pixels one at a time
-    for (int pixel = 0; pixel < image_pixels - 1; pixel++) {
-        // Copy current partial image to device (replicated across batch)
-        for (int b = 0; b < sim->batch_size; b++) {
-            CHECK_CUDA(cudaMemcpy(&d_input_tokens[b * image_pixels], h_tokens, image_pixels * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    // Iterate from T to 1
+    for (int t = sim->T; t >= 1; t--) {
+        // Predict epsilon at time t
+        forward_pass_sim(sim, d_x, d_class_labels, t);
+        
+        // Copy predicted epsilon: output head has shape [B*seq_len * 1], contiguous
+        // We'll use the same buffer pointer directly
+        float* d_eps_hat = sim->output_mlp->d_layer_output;
+        
+        // Sample z for next step (except for t=1)
+        if (t > 1) {
+            curandGenerateNormal(gen, d_z, sim->batch_size * sim->seq_len, 0.0f, 1.0f);
         }
         
-        // Forward pass with class conditioning
-        forward_pass_sim(sim, d_input_tokens, d_class_labels);
+        // DDPM step: x_{t-1}
+        ddpm_step_kernel<<<grid, block>>>(
+            d_x_prev, d_x, d_eps_hat, d_z,
+            sim->d_alphas, sim->d_sqrt_one_minus_alphas_cumprod, sim->d_sqrt_recip_alphas, sim->d_sqrt_betas,
+            t - 1, sim->batch_size * sim->seq_len, (t > 1 ? 1 : 0)
+        );
         
-        // Get logits for the current pixel position (use first batch element)
-        CHECK_CUDA(cudaMemcpy(h_logits, &sim->output_mlp->d_layer_output[pixel * sim->vocab_size], sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-        
-        // Apply temperature and softmax
-        float max_logit = -1e30f;
-        for (int v = 0; v < sim->vocab_size; v++) {
-            h_logits[v] /= temperature;
-            if (h_logits[v] > max_logit) max_logit = h_logits[v];
-        }
-        
-        float sum_exp = 0.0f;
-        for (int v = 0; v < sim->vocab_size; v++) {
-            float exp_val = expf(h_logits[v] - max_logit);
-            h_logits[v] = exp_val;
-            sum_exp += exp_val;
-        }
-        
-        for (int v = 0; v < sim->vocab_size; v++) {
-            h_logits[v] /= sum_exp;
-        }
-        
-        // Sample from the distribution
-        float r = (float)rand() / (float)RAND_MAX;
-        unsigned char next_token = 0;
-        float cumsum = 0.0f;
-        for (int v = 0; v < sim->vocab_size; v++) {
-            cumsum += h_logits[v];
-            if (r <= cumsum) {
-                next_token = v;
-                break;
-            }
-        }
-        
-        // Set the next pixel
-        h_tokens[pixel + 1] = next_token;
-        
-        if (pixel % 100 == 0) {
-            printf("Generated pixel %d/%d\n", pixel + 1, image_pixels);
-        }
+        // Swap buffers: d_x <= d_x_prev
+        float* tmp = d_x;
+        d_x = d_x_prev;
+        d_x_prev = tmp;
     }
     
-    // Convert tokens back to float image
-    tokens_to_float(h_tokens, generated_image, image_pixels);
+    // After loop, d_x holds x_0 (for batch); copy first image to host
+    CHECK_CUDA(cudaMemcpy(generated_image, d_x, image_pixels * sizeof(float), cudaMemcpyDeviceToHost));
     
-    free(h_tokens);
-    free(h_class_labels);
-    free(h_logits);
-    CHECK_CUDA(cudaFree(d_class_labels));
+    CHECK_CUDA(cudaFree(d_x));
+    CHECK_CUDA(cudaFree(d_x_prev));
+    CHECK_CUDA(cudaFree(d_z));
 }
 
 int main(int argc, char* argv[]) {
@@ -134,14 +119,15 @@ int main(int argc, char* argv[]) {
         mkdir("generated_images", 0755);
     }
 
-    // Parameters
-    const int seq_len = 784;  // 28x28 pixels
+    // Parameters (can be tuned)
+    const int seq_len = 784;   // 28x28 pixels
     const int d_model = 384;
     const int hidden_dim = 1536;
     const int num_layers = 6;
     const int batch_size = 4;
+    const int T = 1000;        // diffusion steps
     
-    // Load MNIST data
+    // Load MNIST data (float images in [-1, 1])
     float* mnist_images = NULL;
     int num_images = 0;
     load_mnist_data(&mnist_images, &num_images, "../train-images-idx3-ubyte");
@@ -170,18 +156,6 @@ int main(int argc, char* argv[]) {
     
     printf("Data loaded successfully: %d images with matching labels\n", num_images);
     
-    // Convert float images to token sequences
-    unsigned char* input_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
-    unsigned char* target_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
-    
-    for (int img = 0; img < num_images; img++) {
-        float_to_tokens(&mnist_images[img * seq_len], &input_tokens[img * seq_len], seq_len);
-        // Target is shifted by one pixel
-        memcpy(&target_tokens[img * seq_len], &input_tokens[img * seq_len] + 1, (seq_len - 1) * sizeof(unsigned char));
-        // Pad last target with 0
-        target_tokens[img * seq_len + seq_len - 1] = 0;
-    }
-    
     // Save some sample images with their labels to verify loading
     printf("Saving sample images with labels to verify data loading...\n");
     for (int i = 0; i < 10; i++) {
@@ -191,88 +165,112 @@ int main(int argc, char* argv[]) {
         printf("Saved sample %d: label=%d, file=%s\n", i, mnist_labels[i], sample_filename);
     }
     
-    // Initialize or load SIM
+    // Initialize or load SIM (Diffusion model)
     if (argc > 1) {
         printf("Loading checkpoint: %s\n", argv[1]);
         sim = load_sim(argv[1], batch_size, cublaslt_handle);
     } else {
-        printf("Initializing new model...\n");
-        sim = init_sim(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
+        printf("Initializing new diffusion model...\n");
+        sim = init_sim(seq_len, d_model, hidden_dim, num_layers, batch_size, T, cublaslt_handle);
     }
     
-    printf("Total parameters: ~%.1fM\n", (float)(sim->vocab_size * d_model + d_model * sim->vocab_size + num_layers * (4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
+    // Rough parameter count estimate
+    float approx_params =
+        (float)(d_model * 2) +                                    // input projection w & b
+        (float)(num_layers * (4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) + // transformer
+        (float)(d_model * hidden_dim + hidden_dim * 1);           // output mlp
+    printf("Approx total parameters: ~%.1fM\n", approx_params / 1e6f);
     
     // Training parameters
     const int num_epochs = 20;
     const float learning_rate = 0.0001f;
     const int num_batches = num_images / batch_size;
 
+    // cuRAND generator
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, (unsigned long long)time(NULL));
+    
     // Allocate device memory for batch data
-    unsigned char *d_input_tokens, *d_target_tokens, *d_class_labels;
-    CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned char)));
-    CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned char)));
+    float *d_x0, *d_noise, *d_x_t;
+    unsigned char *d_class_labels;
+    CHECK_CUDA(cudaMalloc(&d_x0, batch_size * seq_len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_noise, batch_size * seq_len * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_x_t, batch_size * seq_len * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_class_labels, batch_size * sizeof(unsigned char)));
+    
+    int block = 256;
+    int grid = (batch_size * seq_len + block - 1) / block;
     
     // Training loop
     for (int epoch = 0; epoch < num_epochs + 1; epoch++) {
         float epoch_loss = 0.0f;
         
         for (int batch = 0; batch < num_batches; batch++) {
-            // Calculate batch offset
-            int batch_offset = batch * batch_size * seq_len;
-
+            int img_offset = batch * batch_size * seq_len;
+            int lbl_offset = batch * batch_size;
+            
             // Copy batch data to device
-            CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch_offset], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
-            CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch_offset], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
-            CHECK_CUDA(cudaMemcpy(d_class_labels, &mnist_labels[batch * batch_size], batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(d_x0, &mnist_images[img_offset], batch_size * seq_len * sizeof(float), cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(d_class_labels, &mnist_labels[lbl_offset], batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
             
-            // Forward pass with class conditioning
-            forward_pass_sim(sim, d_input_tokens, d_class_labels);
+            // Sample timestep t uniform in [1, T]
+            int t = (rand() % sim->T) + 1;
             
-            // Calculate loss
-            float loss = calculate_loss_sim(sim, d_target_tokens);
-            if(loss >= 8.0) raise(SIGINT);
+            // Sample noise
+            curandGenerateNormal(gen, d_noise, batch_size * seq_len, 0.0f, 1.0f);
             
+            // Compute x_t
+            add_noise_kernel<<<grid, block>>>(
+                d_x_t, d_x0, d_noise,
+                sim->d_sqrt_alphas_cumprod, sim->d_sqrt_one_minus_alphas_cumprod,
+                t - 1, batch_size * seq_len
+            );
+            
+            // Forward pass (predict epsilon)
+            forward_pass_sim(sim, d_x_t, d_class_labels, t);
+            
+            // Loss: MSE between predicted epsilon and true noise
+            float loss = calculate_loss_sim(sim, d_noise);
             epoch_loss += loss;
-
+            
             // Don't update weights after final evaluation
             if (epoch == num_epochs) continue;
-
-            // Backward pass
-            zero_gradients_sim(sim);
-            backward_pass_sim(sim, d_input_tokens, d_class_labels);
             
-            // Update weights
+            // Backward & update
+            zero_gradients_sim(sim);
+            backward_pass_sim(sim, d_x_t);
             update_weights_sim(sim, learning_rate);
             
-            // Print progress
-            if (batch % 10 == 0) {
-                printf("Epoch [%d/%d], Batch [%d/%d], Loss: %.6f\n", epoch, num_epochs, batch, num_batches, loss);
+            if (batch % 50 == 0) {
+                printf("Epoch [%d/%d], Batch [%d/%d], t=%d, Loss: %.6f\n", epoch, num_epochs, batch, num_batches, t, loss);
             }
             
-            // Generate sample images periodically with specific class conditioning
-            if (batch > 0 && batch % 500 == 0) {
+            // Generate occasional sample during training
+            if (batch > 0 && batch % 1000 == 0) {
                 printf("\n--- Generating sample image (epoch %d, batch %d) ---\n", epoch, batch);
-                
-                // Get a random class from current batch
+                // Pick a random class from current batch
                 int batch_img_idx = batch * batch_size + (rand() % batch_size);
                 unsigned char target_class = mnist_labels[batch_img_idx];
                 
-                float* generated_image = (float*)malloc(seq_len * sizeof(float));
-                generate_image(sim, generated_image, 0.8f, d_input_tokens, target_class);
+                unsigned char* h_class = (unsigned char*)malloc(batch_size * sizeof(unsigned char));
+                for (int b = 0; b < batch_size; b++) h_class[b] = target_class;
+                CHECK_CUDA(cudaMemcpy(d_class_labels, h_class, batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
+                free(h_class);
                 
-                // Save generated image with target class
+                float* generated_image = (float*)malloc(seq_len * sizeof(float));
+                generate_image(sim, generated_image, 1.0f, d_class_labels, gen);
+                
                 char gen_filename[256];
                 snprintf(gen_filename, sizeof(gen_filename), "generated_images/generated_epoch_%d_batch_%d_class_%d.png", epoch, batch, target_class);
                 save_mnist_image_png(generated_image, gen_filename);
-                
                 printf("Saved generated image (target class %d): %s\n", target_class, gen_filename);
                 printf("--- End generation ---\n\n");
                 
                 free(generated_image);
             }
-
-            // Checkpoint model periodically
+            
+            // Checkpoint
             if (batch > 0 && batch % 2000 == 0) {
                 char checkpoint_fname[64];
                 snprintf(checkpoint_fname, sizeof(checkpoint_fname), "checkpoint_sim.bin");
@@ -281,16 +279,19 @@ int main(int argc, char* argv[]) {
         }
         
         epoch_loss /= num_batches;
-
-        // Print epoch summary
         printf("Epoch [%d/%d] completed, Average Loss: %.6f\n", epoch, num_epochs, epoch_loss);
         
-        // Generate sample at end of each epoch for each digit class
+        // Generate end-of-epoch samples for each digit
         if (epoch < num_epochs) {
             printf("Generating end-of-epoch samples for each digit...\n");
             for (int digit = 0; digit < 10; digit++) {
+                unsigned char* h_class = (unsigned char*)malloc(batch_size * sizeof(unsigned char));
+                for (int b = 0; b < batch_size; b++) h_class[b] = (unsigned char)digit;
+                CHECK_CUDA(cudaMemcpy(d_class_labels, h_class, batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
+                free(h_class);
+                
                 float* generated_image = (float*)malloc(seq_len * sizeof(float));
-                generate_image(sim, generated_image, 0.7f, d_input_tokens, (unsigned char)digit);
+                generate_image(sim, generated_image, 1.0f, d_class_labels, gen);
                 
                 char gen_filename[256];
                 snprintf(gen_filename, sizeof(gen_filename), "generated_images/epoch_%d_class_%d_sample.png", epoch, digit);
@@ -307,21 +308,25 @@ int main(int argc, char* argv[]) {
     time_t now = time(NULL);
     strftime(model_fname, sizeof(model_fname), "%Y%m%d_%H%M%S_sim.bin", localtime(&now));
 
-    // Save model with timestamped filename
+    // Save final model
     save_sim(sim, model_fname);
     
-    // Generate final samples for each digit with different temperatures
+    // Generate final samples for each digit (using DDPM; temperature unused)
     printf("\nGenerating final samples for each digit...\n");
     for (int digit = 0; digit < 10; digit++) {
-        for (int temp_idx = 0; temp_idx < 3; temp_idx++) {
-            float temperature = 0.5f + temp_idx * 0.2f;
+        unsigned char* h_class = (unsigned char*)malloc(batch_size * sizeof(unsigned char));
+        for (int b = 0; b < batch_size; b++) h_class[b] = (unsigned char)digit;
+        CHECK_CUDA(cudaMemcpy(d_class_labels, h_class, batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
+        free(h_class);
+        
+        for (int sample_idx = 0; sample_idx < 3; sample_idx++) {
             float* generated_image = (float*)malloc(seq_len * sizeof(float));
-            generate_image(sim, generated_image, temperature, d_input_tokens, (unsigned char)digit);
+            generate_image(sim, generated_image, 1.0f, d_class_labels, gen);
             
             char gen_filename[256];
-            snprintf(gen_filename, sizeof(gen_filename), "generated_images/final_class_%d_temp_%.1f_sample_%d.png", digit, temperature, temp_idx);
+            snprintf(gen_filename, sizeof(gen_filename), "generated_images/final_class_%d_sample_%d.png", digit, sample_idx);
             save_mnist_image_png(generated_image, gen_filename);
-            printf("Saved final class %d sample (temp %.1f): %s\n", digit, temperature, gen_filename);
+            printf("Saved final class %d sample: %s\n", digit, gen_filename);
             
             free(generated_image);
         }
@@ -330,11 +335,11 @@ int main(int argc, char* argv[]) {
     // Cleanup
     free(mnist_images);
     free(mnist_labels);
-    free(input_tokens);
-    free(target_tokens);
-    CHECK_CUDA(cudaFree(d_input_tokens));
-    CHECK_CUDA(cudaFree(d_target_tokens));
+    CHECK_CUDA(cudaFree(d_x0));
+    CHECK_CUDA(cudaFree(d_noise));
+    CHECK_CUDA(cudaFree(d_x_t));
     CHECK_CUDA(cudaFree(d_class_labels));
+    curandDestroyGenerator(gen);
     free_sim(sim);
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
