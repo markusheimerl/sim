@@ -21,67 +21,40 @@ void handle_sigint(int signum) {
     exit(128 + signum);
 }
 
-// Convert float image [-1,1] to unsigned char tokens [0,255]
-void float_to_tokens(float* image, unsigned char* tokens, int size) {
-    for (int i = 0; i < size; i++) {
-        // Clamp to [-1, 1] and convert to [0, 255]
-        float val = fmaxf(-1.0f, fminf(1.0f, image[i]));
-        tokens[i] = (unsigned char)((val + 1.0f) * 127.5f);
-    }
-}
-
-// Convert unsigned char tokens [0,255] back to float image [-1,1]
-void tokens_to_float(unsigned char* tokens, float* image, int size) {
-    for (int i = 0; i < size; i++) {
-        image[i] = (tokens[i] / 127.5f) - 1.0f;
-    }
-}
-
-// Embed class information into first pixel and free labels
-void embed_class_in_first_pixel(float* mnist_images, unsigned char* mnist_labels, int num_images) {
+// Embed class information into first pixel
+void embed_class_in_first_pixel(unsigned char* mnist_images, unsigned char* mnist_labels, int num_images) {
     for (int img = 0; img < num_images; img++) {
-        // Map class 0-9 to dark values: 0->-1.0, 1->-0.9, ..., 9->-0.1
-        float class_value = -1.0f + (mnist_labels[img] * 0.1f);
-        mnist_images[img * 784] = class_value; // Overwrite first pixel
+        unsigned char class_byte = mnist_labels[img];
+        mnist_images[img * 784] = class_byte;
     }
     printf("Embedded class information into first pixel of all images\n");
 }
 
-// Extract class from first pixel for generation
-unsigned char extract_class_from_first_pixel(float first_pixel_value) {
-    // Inverse of the embedding: class = (value + 1.0) / 0.1
-    float class_float = (first_pixel_value + 1.0f) / 0.1f;
-    return (unsigned char)round(fmaxf(0.0f, fminf(9.0f, class_float)));
-}
-
 // Generate image function using autoregressive sampling
-void generate_image(SIM* sim, float* generated_image, float temperature, unsigned char* d_input_tokens, unsigned char target_class) {
+void generate_image(SIM* sim, unsigned char* generated_image, float temperature, unsigned char* d_input_tokens, unsigned char target_class) {
     const int image_pixels = 28 * 28;
     
-    // Start with all zeros (black image)
+    // Start with black image
     unsigned char* h_tokens = (unsigned char*)malloc(image_pixels * sizeof(unsigned char));
     memset(h_tokens, 0, image_pixels * sizeof(unsigned char));
     
     // Set first pixel to target class
-    float class_value = -1.0f + (target_class * 0.1f);
-    h_tokens[0] = (unsigned char)((class_value + 1.0f) * 127.5f);
+    h_tokens[0] = target_class;
     
     printf("Generating class %d image pixel by pixel...\n", target_class);
     
     // Allocate logits buffer on host
     float* h_logits = (float*)malloc(sim->vocab_size * sizeof(float));
     
-    // Generate pixels one at a time (starting from pixel 1, since pixel 0 is the class)
+    // Generate pixels one at a time
     for (int pixel = 0; pixel < image_pixels - 1; pixel++) {
-        // Copy current partial image to device (replicated across batch)
-        for (int b = 0; b < sim->batch_size; b++) {
-            CHECK_CUDA(cudaMemcpy(&d_input_tokens[b * image_pixels], h_tokens, image_pixels * sizeof(unsigned char), cudaMemcpyHostToDevice));
-        }
+        // Copy current partial image to device
+        CHECK_CUDA(cudaMemcpy(&d_input_tokens[image_pixels], h_tokens, image_pixels * sizeof(unsigned char), cudaMemcpyHostToDevice));
         
         // Forward pass
         forward_pass_sim(sim, d_input_tokens);
         
-        // Get logits for the current pixel position (use first batch element)
+        // Get logits for the current pixel position
         CHECK_CUDA(cudaMemcpy(h_logits, &sim->output_mlp->d_output[pixel * sim->vocab_size], sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         
         // Apply temperature and softmax
@@ -122,8 +95,8 @@ void generate_image(SIM* sim, float* generated_image, float temperature, unsigne
         }
     }
     
-    // Convert tokens back to float image
-    tokens_to_float(h_tokens, generated_image, image_pixels);
+    // Copy tokens to output image
+    memcpy(generated_image, h_tokens, image_pixels * sizeof(unsigned char));
     
     free(h_tokens);
     free(h_logits);
@@ -144,34 +117,27 @@ int main(int argc, char* argv[]) {
     const int num_layers = 12;
     const int batch_size = 64;
     
-    // Load MNIST data and labels
-    float* mnist_images = NULL;
+    // Load MNIST data and embed class information into first pixel
+    unsigned char* mnist_images = NULL;
     unsigned char* mnist_labels = NULL;
     int num_images, num_labels = 0;
     load_mnist_data(&mnist_images, &num_images, "../train-images-idx3-ubyte");
     load_mnist_labels(&mnist_labels, &num_labels, "../train-labels-idx1-ubyte");
-
-    // Embed class information into first pixel
     embed_class_in_first_pixel(mnist_images, mnist_labels, num_images);
     
-    // Convert float images to token sequences
-    unsigned char* input_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
-    unsigned char* target_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
+    // Create token sequences
+    unsigned char* input_tokens = (unsigned char*)calloc(num_images * seq_len * sizeof(unsigned char));
+    unsigned char* target_tokens = (unsigned char*)calloc(num_images * seq_len * sizeof(unsigned char));
     
     for (int img = 0; img < num_images; img++) {
-        float_to_tokens(&mnist_images[img * seq_len], &input_tokens[img * seq_len], seq_len);
-        // Target is shifted by one pixel
+        memcpy(&input_tokens[img * seq_len], &mnist_images[img * seq_len], seq_len * sizeof(unsigned char));
         memcpy(&target_tokens[img * seq_len], &input_tokens[img * seq_len] + 1, (seq_len - 1) * sizeof(unsigned char));
-        // Pad last target with 0
-        target_tokens[img * seq_len + seq_len - 1] = 0;
     }
     
     // Save some sample images to verify preprocessing
     printf("Saving sample images to verify class embedding...\n");
     for (int i = 0; i < 10; i++) {
-        unsigned char first_pixel_token = input_tokens[i * seq_len];
-        float first_pixel_value = (first_pixel_token / 127.5f) - 1.0f;
-        unsigned char extracted_class = extract_class_from_first_pixel(first_pixel_value);
+        unsigned char extracted_class = input_tokens[i * seq_len];
         
         char sample_filename[256];
         snprintf(sample_filename, sizeof(sample_filename), "sample_embedded_class_%d_idx_%d.png", extracted_class, i);
@@ -242,7 +208,7 @@ int main(int argc, char* argv[]) {
                 
                 unsigned char target_class = (unsigned char)(rand() % 10);
                 
-                float* generated_image = (float*)malloc(seq_len * sizeof(float));
+                unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
                 generate_image(sim, generated_image, 0.8f, d_input_tokens, target_class);
                 
                 // Save generated image with target class
@@ -273,7 +239,7 @@ int main(int argc, char* argv[]) {
         if (epoch < num_epochs) {
             printf("Generating end-of-epoch samples for each digit...\n");
             for (int digit = 0; digit < 10; digit++) {
-                float* generated_image = (float*)malloc(seq_len * sizeof(float));
+                unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
                 generate_image(sim, generated_image, 0.7f, d_input_tokens, (unsigned char)digit);
                 
                 char gen_filename[256];
