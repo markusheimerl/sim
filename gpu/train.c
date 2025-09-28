@@ -126,8 +126,8 @@ int main(int argc, char* argv[]) {
     embed_class_in_first_pixel(mnist_images, mnist_labels, num_images);
     
     // Create token sequences
-    unsigned char* input_tokens = (unsigned char*)calloc(num_images * seq_len * sizeof(unsigned char));
-    unsigned char* target_tokens = (unsigned char*)calloc(num_images * seq_len * sizeof(unsigned char));
+    unsigned char* input_tokens = (unsigned char*)calloc(num_images * seq_len, sizeof(unsigned char));
+    unsigned char* target_tokens = (unsigned char*)calloc(num_images * seq_len, sizeof(unsigned char));
     
     for (int img = 0; img < num_images; img++) {
         memcpy(&input_tokens[img * seq_len], &mnist_images[img * seq_len], seq_len * sizeof(unsigned char));
@@ -243,7 +243,7 @@ int main(int argc, char* argv[]) {
                 generate_image(sim, generated_image, 0.7f, d_input_tokens, (unsigned char)digit);
                 
                 char gen_filename[256];
-                snprintf(gen_filename, sizeof(gen_filename), "generated_images/epoch_%d_class_%d_sample.png", epoch, digit);
+                snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_sample.png", epoch, digit);
                 save_mnist_image_png(generated_image, gen_filename);
                 printf("Saved epoch %d class %d sample: %s\n", epoch, digit, gen_filename);
                 
