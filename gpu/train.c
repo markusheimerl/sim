@@ -31,12 +31,10 @@ void embed_class_in_first_pixel(unsigned char* mnist_images, unsigned char* mnis
 }
 
 // Generate image function using autoregressive sampling
-void generate_image(SIM* sim, unsigned char* generated_image, float temperature, unsigned char* d_input_tokens, unsigned char target_class) {
-    const int image_pixels = 28 * 28;
-    
+void generate_image(SIM* sim, unsigned char* generated_image, float temperature, unsigned char* d_input_tokens, unsigned int seq_len, unsigned char target_class) {
     // Start with black image
-    unsigned char* h_tokens = (unsigned char*)malloc(image_pixels * sizeof(unsigned char));
-    memset(h_tokens, 0, image_pixels * sizeof(unsigned char));
+    unsigned char* h_tokens = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
+    memset(h_tokens, 0, seq_len * sizeof(unsigned char));
     
     // Set first pixel to target class
     h_tokens[0] = target_class;
@@ -47,10 +45,10 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
     float* h_logits = (float*)malloc(sim->vocab_size * sizeof(float));
     
     // Generate pixels one at a time
-    for (int pixel = 0; pixel < image_pixels - 1; pixel++) {
+    for (int pixel = 0; pixel < seq_len - 1; pixel++) {
         // Copy current partial image to device
-        CHECK_CUDA(cudaMemcpy(&d_input_tokens[image_pixels], h_tokens, image_pixels * sizeof(unsigned char), cudaMemcpyHostToDevice));
-        
+        CHECK_CUDA(cudaMemcpy(&d_input_tokens[seq_len], h_tokens, seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
+
         // Forward pass
         forward_pass_sim(sim, d_input_tokens);
         
@@ -89,14 +87,16 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
         
         // Set the next pixel
         h_tokens[pixel + 1] = next_token;
-        
-        if (pixel % 100 == 0) {
-            printf("Generated pixel %d/%d\n", pixel + 1, image_pixels);
+
+        if (pixel % 10 == 0 || pixel == (int)(seq_len - 2)) {
+            printf("\rGenerating pixels... %3d%% (%d/%d)", (pixel + 1) * 100 / (seq_len - 1), pixel + 1, seq_len - 1);
+            fflush(stdout);
         }
+        if (pixel == (int)(seq_len - 2)) printf("\n");
     }
     
     // Copy tokens to output image
-    memcpy(generated_image, h_tokens, image_pixels * sizeof(unsigned char));
+    memcpy(generated_image, h_tokens, seq_len * sizeof(unsigned char));
     
     free(h_tokens);
     free(h_logits);
@@ -111,7 +111,7 @@ int main(int argc, char* argv[]) {
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
 
     // Parameters
-    const int seq_len = 784;  // 28x28 pixels
+    const int seq_len = 28 * 28;
     const int d_model = 512;
     const int hidden_dim = 2048;
     const int num_layers = 12;
@@ -203,13 +203,13 @@ int main(int argc, char* argv[]) {
             }
             
             // Generate sample images periodically
-            if (batch > 0 && batch % 500 == 0) {
+            if (batch > 0 && batch % 400 == 0) {
                 printf("\n--- Generating sample image (epoch %d, batch %d) ---\n", epoch, batch);
                 
                 unsigned char target_class = (unsigned char)(rand() % 10);
                 
                 unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-                generate_image(sim, generated_image, 0.8f, d_input_tokens, target_class);
+                generate_image(sim, generated_image, 0.8f, d_input_tokens, seq_len, target_class);
                 
                 // Save generated image with target class
                 char gen_filename[256];
@@ -240,7 +240,7 @@ int main(int argc, char* argv[]) {
             printf("Generating end-of-epoch samples for each digit...\n");
             for (int digit = 0; digit < 10; digit++) {
                 unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-                generate_image(sim, generated_image, 0.7f, d_input_tokens, (unsigned char)digit);
+                generate_image(sim, generated_image, 0.7f, d_input_tokens, seq_len, (unsigned char)digit);
                 
                 char gen_filename[256];
                 snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_sample.png", epoch, digit);
@@ -252,12 +252,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Get timestamp for filenames
+    // Get timestamp for filenames and save final model
     char model_fname[64];
     time_t now = time(NULL);
     strftime(model_fname, sizeof(model_fname), "%Y%m%d_%H%M%S_sim.bin", localtime(&now));
-
-    // Save model with timestamped filename
     save_sim(sim, model_fname);
     
     // Cleanup
