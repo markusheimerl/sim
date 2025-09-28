@@ -45,9 +45,9 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
     float* h_logits = (float*)malloc(sim->vocab_size * sizeof(float));
     
     // Generate pixels one at a time
-    for (int pixel = 0; pixel < seq_len - 1; pixel++) {
+    for (int pixel = 0; pixel < (int)(seq_len - 1); pixel++) {
         // Copy current partial image to device
-        CHECK_CUDA(cudaMemcpy(&d_input_tokens[seq_len], h_tokens, seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
 
         // Forward pass
         forward_pass_sim(sim, d_input_tokens);
@@ -158,7 +158,7 @@ int main(int argc, char* argv[]) {
     
     // Training parameters
     const int num_epochs = 200;
-    const float learning_rate = 0.00001f;
+    const float learning_rate = 0.00007f;
     const int num_batches = num_images / batch_size;
 
     // Allocate device memory for batch data
@@ -221,13 +221,6 @@ int main(int argc, char* argv[]) {
                 
                 free(generated_image);
             }
-
-            // Checkpoint model periodically
-            if (batch > 0 && batch % 2000 == 0) {
-                char checkpoint_fname[64];
-                snprintf(checkpoint_fname, sizeof(checkpoint_fname), "checkpoint_sim.bin");
-                save_sim(sim, checkpoint_fname);
-            }
         }
         
         epoch_loss /= num_batches;
@@ -240,7 +233,7 @@ int main(int argc, char* argv[]) {
             printf("Generating end-of-epoch samples for each digit...\n");
             for (int digit = 0; digit < 10; digit++) {
                 unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-                generate_image(sim, generated_image, 0.7f, d_input_tokens, seq_len, (unsigned char)digit);
+                generate_image(sim, generated_image, 0.8f, d_input_tokens, seq_len, (unsigned char)digit);
                 
                 char gen_filename[256];
                 snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_sample.png", epoch, digit);
@@ -249,6 +242,11 @@ int main(int argc, char* argv[]) {
                 
                 free(generated_image);
             }
+
+            // Checkpoint model periodically
+            char checkpoint_fname[64];
+            snprintf(checkpoint_fname, sizeof(checkpoint_fname), "checkpoint_sim.bin");
+            save_sim(sim, checkpoint_fname);
         }
     }
 
