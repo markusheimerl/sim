@@ -136,10 +136,10 @@ int main(int argc, char* argv[]) {
 
     // Parameters
     const int seq_len = 784;  // 28x28 pixels
-    const int d_model = 384;
-    const int hidden_dim = 1536;
-    const int num_layers = 6;
-    const int batch_size = 4;
+    const int d_model = 512;
+    const int hidden_dim = 2048;
+    const int num_layers = 12;
+    const int batch_size = 64;
     
     // Load MNIST data
     float* mnist_images = NULL;
@@ -231,7 +231,7 @@ int main(int argc, char* argv[]) {
             
             // Calculate loss
             float loss = calculate_loss_sim(sim, d_target_tokens);
-            if(loss >= 8.0) raise(SIGINT);
+            if(loss >= 6.0) raise(SIGINT);
             
             epoch_loss += loss;
 
@@ -246,7 +246,7 @@ int main(int argc, char* argv[]) {
             update_weights_sim(sim, learning_rate);
             
             // Print progress
-            if (batch % 10 == 0) {
+            if (batch % 2 == 0) {
                 printf("Epoch [%d/%d], Batch [%d/%d], Loss: %.6f\n", epoch, num_epochs, batch, num_batches, loss);
             }
             
