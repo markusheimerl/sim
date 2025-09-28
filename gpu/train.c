@@ -71,7 +71,7 @@ void generate_image(SIM* sim, float* generated_image, float temperature, unsigne
         forward_pass_sim(sim, d_input_tokens, d_class_labels);
         
         // Get logits for the current pixel position (use first batch element)
-        CHECK_CUDA(cudaMemcpy(h_logits, &sim->output_mlp->d_layer_output[pixel * sim->vocab_size], sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(h_logits, &sim->output_mlp->d_output[pixel * sim->vocab_size], sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         
         // Apply temperature and softmax
         float max_logit = -1e30f;
