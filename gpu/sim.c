@@ -11,7 +11,6 @@ SIM* init_sim(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     sim->hidden_dim = hidden_dim;
     sim->num_layers = num_layers;
     sim->vocab_size = 256;
-    sim->image_size = 28; // MNIST images are 28x28
     sim->cublaslt_handle = cublaslt_handle;
     
     // Initialize Adam parameters
@@ -226,7 +225,7 @@ void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
     
     // Step 2: Add 2D positional encodings
     positional_encoding_kernel<<<grid_emb, block_emb>>>(
-        sim->d_embedded_input, sim->batch_size, sim->seq_len, sim->d_model, sim->image_size
+        sim->d_embedded_input, sim->batch_size, sim->seq_len, sim->d_model, (int)sqrt(sim->seq_len)
     );
     
     // Step 3: Forward pass through transformer
@@ -344,7 +343,6 @@ void save_sim(SIM* sim, const char* filename) {
     fwrite(&sim->hidden_dim, sizeof(int), 1, file);
     fwrite(&sim->num_layers, sizeof(int), 1, file);
     fwrite(&sim->vocab_size, sizeof(int), 1, file);
-    fwrite(&sim->image_size, sizeof(int), 1, file);
     
     int token_emb_size = sim->vocab_size * sim->d_model;
     
@@ -405,14 +403,13 @@ SIM* load_sim(const char* filename, int custom_batch_size, cublasLtHandle_t cubl
     }
     
     // Read dimensions
-    int seq_len, d_model, stored_batch_size, hidden_dim, num_layers, vocab_size, image_size;
+    int seq_len, d_model, stored_batch_size, hidden_dim, num_layers, vocab_size;
     fread(&seq_len, sizeof(int), 1, file);
     fread(&d_model, sizeof(int), 1, file);
     fread(&stored_batch_size, sizeof(int), 1, file);
     fread(&hidden_dim, sizeof(int), 1, file);
     fread(&num_layers, sizeof(int), 1, file);
     fread(&vocab_size, sizeof(int), 1, file);
-    fread(&image_size, sizeof(int), 1, file);
     
     // Use custom_batch_size if provided, otherwise use stored value
     int batch_size = (custom_batch_size > 0) ? custom_batch_size : stored_batch_size;

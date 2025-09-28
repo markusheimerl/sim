@@ -67,7 +67,6 @@ typedef struct {
     int hidden_dim;
     int num_layers;
     int vocab_size; // 256 for pixel values
-    int image_size; // 28 for MNIST
 } SIM;
 
 // Function prototypes

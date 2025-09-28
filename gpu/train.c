@@ -137,12 +137,6 @@ int main(int argc, char* argv[]) {
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
 
-    // Create output directory
-    struct stat st;
-    if (stat("generated_images", &st) == -1) {
-        mkdir("generated_images", 0755);
-    }
-
     // Parameters
     const int seq_len = 784;  // 28x28 pixels
     const int d_model = 512;
@@ -150,39 +144,15 @@ int main(int argc, char* argv[]) {
     const int num_layers = 12;
     const int batch_size = 64;
     
-    // Load MNIST data
+    // Load MNIST data and labels
     float* mnist_images = NULL;
-    int num_images = 0;
-    load_mnist_data(&mnist_images, &num_images, "../train-images-idx3-ubyte");
-    if (!mnist_images) {
-        printf("Error: Could not load MNIST data\n");
-        return 1;
-    }
-    
-    // Load MNIST labels
     unsigned char* mnist_labels = NULL;
-    int num_labels = 0;
+    int num_images, num_labels = 0;
+    load_mnist_data(&mnist_images, &num_images, "../train-images-idx3-ubyte");
     load_mnist_labels(&mnist_labels, &num_labels, "../train-labels-idx1-ubyte");
-    if (!mnist_labels) {
-        printf("Error: Could not load MNIST labels\n");
-        free(mnist_images);
-        return 1;
-    }
-    
-    // Verify data and labels match
-    if (num_images != num_labels) {
-        printf("Error: Number of images (%d) doesn't match number of labels (%d)\n", num_images, num_labels);
-        free(mnist_images);
-        free(mnist_labels);
-        return 1;
-    }
-    
-    printf("Data loaded successfully: %d images with matching labels\n", num_images);
-    
-    // Embed class information into first pixel and free labels
+
+    // Embed class information into first pixel
     embed_class_in_first_pixel(mnist_images, mnist_labels, num_images);
-    free(mnist_labels);
-    mnist_labels = NULL;
     
     // Convert float images to token sequences
     unsigned char* input_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
@@ -204,7 +174,7 @@ int main(int argc, char* argv[]) {
         unsigned char extracted_class = extract_class_from_first_pixel(first_pixel_value);
         
         char sample_filename[256];
-        snprintf(sample_filename, sizeof(sample_filename), "generated_images/sample_embedded_class_%d_idx_%d.png", extracted_class, i);
+        snprintf(sample_filename, sizeof(sample_filename), "sample_embedded_class_%d_idx_%d.png", extracted_class, i);
         save_mnist_image_png(&mnist_images[i * seq_len], sample_filename);
         printf("Saved sample %d: embedded_class=%d, file=%s\n", i, extracted_class, sample_filename);
     }
@@ -277,7 +247,7 @@ int main(int argc, char* argv[]) {
                 
                 // Save generated image with target class
                 char gen_filename[256];
-                snprintf(gen_filename, sizeof(gen_filename), "generated_images/generated_epoch_%d_batch_%d_class_%d.png", epoch, batch, target_class);
+                snprintf(gen_filename, sizeof(gen_filename), "generated_epoch_%d_batch_%d_class_%d.png", epoch, batch, target_class);
                 save_mnist_image_png(generated_image, gen_filename);
                 
                 printf("Saved generated image (target class %d): %s\n", target_class, gen_filename);
@@ -324,25 +294,9 @@ int main(int argc, char* argv[]) {
     // Save model with timestamped filename
     save_sim(sim, model_fname);
     
-    // Generate final samples for each digit with different temperatures
-    printf("\nGenerating final samples for each digit...\n");
-    for (int digit = 0; digit < 10; digit++) {
-        for (int temp_idx = 0; temp_idx < 3; temp_idx++) {
-            float temperature = 0.5f + temp_idx * 0.2f;
-            float* generated_image = (float*)malloc(seq_len * sizeof(float));
-            generate_image(sim, generated_image, temperature, d_input_tokens, (unsigned char)digit);
-            
-            char gen_filename[256];
-            snprintf(gen_filename, sizeof(gen_filename), "generated_images/final_class_%d_temp_%.1f_sample_%d.png", digit, temperature, temp_idx);
-            save_mnist_image_png(generated_image, gen_filename);
-            printf("Saved final class %d sample (temp %.1f): %s\n", digit, temperature, gen_filename);
-            
-            free(generated_image);
-        }
-    }
-    
     // Cleanup
     free(mnist_images);
+    free(mnist_labels);
     free(input_tokens);
     free(target_tokens);
     CHECK_CUDA(cudaFree(d_input_tokens));
