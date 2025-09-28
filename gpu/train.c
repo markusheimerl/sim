@@ -191,8 +191,8 @@ int main(int argc, char* argv[]) {
     printf("Total parameters: ~%.1fM\n", (float)(sim->vocab_size * d_model + d_model * sim->vocab_size + num_layers * (4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
     
     // Training parameters
-    const int num_epochs = 20;
-    const float learning_rate = 0.0001f;
+    const int num_epochs = 200;
+    const float learning_rate = 0.00001f;
     const int num_batches = num_images / batch_size;
 
     // Allocate device memory for batch data

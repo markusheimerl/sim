@@ -34,5 +34,4 @@ cont: train.out
 	@time ./train.out $$(ls -t *_sim.bin 2>/dev/null | head -n1)
 
 clean:
-	rm -f *.out *.csv *.o ../data.o
-	rm -rf generated_images/
+	rm -f *.out *.png *.o ../data.o
