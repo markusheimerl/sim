@@ -68,16 +68,15 @@ typedef struct {
     int num_layers;
     int vocab_size; // 256 for pixel values
     int image_size; // 28 for MNIST
-    int num_classes; // 10 for MNIST digits
 } SIM;
 
 // Function prototypes
 SIM* init_sim(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle);
 void free_sim(SIM* sim);
-void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens, unsigned char* d_class_labels);
+void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens);
 float calculate_loss_sim(SIM* sim, unsigned char* d_target_tokens);
 void zero_gradients_sim(SIM* sim);
-void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens, unsigned char* d_class_labels);
+void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens);
 void update_weights_sim(SIM* sim, float learning_rate);
 void save_sim(SIM* sim, const char* filename);
 SIM* load_sim(const char* filename, int custom_batch_size, cublasLtHandle_t cublaslt_handle);

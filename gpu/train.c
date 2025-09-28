@@ -37,7 +37,24 @@ void tokens_to_float(unsigned char* tokens, float* image, int size) {
     }
 }
 
-// Generate image function using autoregressive sampling with class conditioning
+// Embed class information into first pixel and free labels
+void embed_class_in_first_pixel(float* mnist_images, unsigned char* mnist_labels, int num_images) {
+    for (int img = 0; img < num_images; img++) {
+        // Map class 0-9 to dark values: 0->-1.0, 1->-0.9, ..., 9->-0.1
+        float class_value = -1.0f + (mnist_labels[img] * 0.1f);
+        mnist_images[img * 784] = class_value; // Overwrite first pixel
+    }
+    printf("Embedded class information into first pixel of all images\n");
+}
+
+// Extract class from first pixel for generation
+unsigned char extract_class_from_first_pixel(float first_pixel_value) {
+    // Inverse of the embedding: class = (value + 1.0) / 0.1
+    float class_float = (first_pixel_value + 1.0f) / 0.1f;
+    return (unsigned char)round(fmaxf(0.0f, fminf(9.0f, class_float)));
+}
+
+// Generate image function using autoregressive sampling
 void generate_image(SIM* sim, float* generated_image, float temperature, unsigned char* d_input_tokens, unsigned char target_class) {
     const int image_pixels = 28 * 28;
     
@@ -45,30 +62,24 @@ void generate_image(SIM* sim, float* generated_image, float temperature, unsigne
     unsigned char* h_tokens = (unsigned char*)malloc(image_pixels * sizeof(unsigned char));
     memset(h_tokens, 0, image_pixels * sizeof(unsigned char));
     
-    // Create class label array for batch (all same class)
-    unsigned char* h_class_labels = (unsigned char*)malloc(sim->batch_size * sizeof(unsigned char));
-    unsigned char* d_class_labels;
-    CHECK_CUDA(cudaMalloc(&d_class_labels, sim->batch_size * sizeof(unsigned char)));
-    
-    for (int b = 0; b < sim->batch_size; b++) {
-        h_class_labels[b] = target_class;
-    }
-    CHECK_CUDA(cudaMemcpy(d_class_labels, h_class_labels, sim->batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
+    // Set first pixel to target class
+    float class_value = -1.0f + (target_class * 0.1f);
+    h_tokens[0] = (unsigned char)((class_value + 1.0f) * 127.5f);
     
     printf("Generating class %d image pixel by pixel...\n", target_class);
     
     // Allocate logits buffer on host
     float* h_logits = (float*)malloc(sim->vocab_size * sizeof(float));
     
-    // Generate pixels one at a time
+    // Generate pixels one at a time (starting from pixel 1, since pixel 0 is the class)
     for (int pixel = 0; pixel < image_pixels - 1; pixel++) {
         // Copy current partial image to device (replicated across batch)
         for (int b = 0; b < sim->batch_size; b++) {
             CHECK_CUDA(cudaMemcpy(&d_input_tokens[b * image_pixels], h_tokens, image_pixels * sizeof(unsigned char), cudaMemcpyHostToDevice));
         }
         
-        // Forward pass with class conditioning
-        forward_pass_sim(sim, d_input_tokens, d_class_labels);
+        // Forward pass
+        forward_pass_sim(sim, d_input_tokens);
         
         // Get logits for the current pixel position (use first batch element)
         CHECK_CUDA(cudaMemcpy(h_logits, &sim->output_mlp->d_output[pixel * sim->vocab_size], sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
@@ -115,9 +126,7 @@ void generate_image(SIM* sim, float* generated_image, float temperature, unsigne
     tokens_to_float(h_tokens, generated_image, image_pixels);
     
     free(h_tokens);
-    free(h_class_labels);
     free(h_logits);
-    CHECK_CUDA(cudaFree(d_class_labels));
 }
 
 int main(int argc, char* argv[]) {
@@ -170,6 +179,11 @@ int main(int argc, char* argv[]) {
     
     printf("Data loaded successfully: %d images with matching labels\n", num_images);
     
+    // Embed class information into first pixel and free labels
+    embed_class_in_first_pixel(mnist_images, mnist_labels, num_images);
+    free(mnist_labels);
+    mnist_labels = NULL;
+    
     // Convert float images to token sequences
     unsigned char* input_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
     unsigned char* target_tokens = (unsigned char*)malloc(num_images * seq_len * sizeof(unsigned char));
@@ -182,13 +196,17 @@ int main(int argc, char* argv[]) {
         target_tokens[img * seq_len + seq_len - 1] = 0;
     }
     
-    // Save some sample images with their labels to verify loading
-    printf("Saving sample images with labels to verify data loading...\n");
+    // Save some sample images to verify preprocessing
+    printf("Saving sample images to verify class embedding...\n");
     for (int i = 0; i < 10; i++) {
+        unsigned char first_pixel_token = input_tokens[i * seq_len];
+        float first_pixel_value = (first_pixel_token / 127.5f) - 1.0f;
+        unsigned char extracted_class = extract_class_from_first_pixel(first_pixel_value);
+        
         char sample_filename[256];
-        snprintf(sample_filename, sizeof(sample_filename), "generated_images/sample_label_%d_idx_%d.png", mnist_labels[i], i);
+        snprintf(sample_filename, sizeof(sample_filename), "generated_images/sample_embedded_class_%d_idx_%d.png", extracted_class, i);
         save_mnist_image_png(&mnist_images[i * seq_len], sample_filename);
-        printf("Saved sample %d: label=%d, file=%s\n", i, mnist_labels[i], sample_filename);
+        printf("Saved sample %d: embedded_class=%d, file=%s\n", i, extracted_class, sample_filename);
     }
     
     // Initialize or load SIM
@@ -208,10 +226,9 @@ int main(int argc, char* argv[]) {
     const int num_batches = num_images / batch_size;
 
     // Allocate device memory for batch data
-    unsigned char *d_input_tokens, *d_target_tokens, *d_class_labels;
+    unsigned char *d_input_tokens, *d_target_tokens;
     CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned char)));
     CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned char)));
-    CHECK_CUDA(cudaMalloc(&d_class_labels, batch_size * sizeof(unsigned char)));
     
     // Training loop
     for (int epoch = 0; epoch < num_epochs + 1; epoch++) {
@@ -224,10 +241,9 @@ int main(int argc, char* argv[]) {
             // Copy batch data to device
             CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch_offset], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch_offset], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
-            CHECK_CUDA(cudaMemcpy(d_class_labels, &mnist_labels[batch * batch_size], batch_size * sizeof(unsigned char), cudaMemcpyHostToDevice));
             
-            // Forward pass with class conditioning
-            forward_pass_sim(sim, d_input_tokens, d_class_labels);
+            // Forward pass
+            forward_pass_sim(sim, d_input_tokens);
             
             // Calculate loss
             float loss = calculate_loss_sim(sim, d_target_tokens);
@@ -240,7 +256,7 @@ int main(int argc, char* argv[]) {
 
             // Backward pass
             zero_gradients_sim(sim);
-            backward_pass_sim(sim, d_input_tokens, d_class_labels);
+            backward_pass_sim(sim, d_input_tokens);
             
             // Update weights
             update_weights_sim(sim, learning_rate);
@@ -250,13 +266,11 @@ int main(int argc, char* argv[]) {
                 printf("Epoch [%d/%d], Batch [%d/%d], Loss: %.6f\n", epoch, num_epochs, batch, num_batches, loss);
             }
             
-            // Generate sample images periodically with specific class conditioning
+            // Generate sample images periodically
             if (batch > 0 && batch % 500 == 0) {
                 printf("\n--- Generating sample image (epoch %d, batch %d) ---\n", epoch, batch);
                 
-                // Get a random class from current batch
-                int batch_img_idx = batch * batch_size + (rand() % batch_size);
-                unsigned char target_class = mnist_labels[batch_img_idx];
+                unsigned char target_class = (unsigned char)(rand() % 10);
                 
                 float* generated_image = (float*)malloc(seq_len * sizeof(float));
                 generate_image(sim, generated_image, 0.8f, d_input_tokens, target_class);
@@ -329,12 +343,10 @@ int main(int argc, char* argv[]) {
     
     // Cleanup
     free(mnist_images);
-    free(mnist_labels);
     free(input_tokens);
     free(target_tokens);
     CHECK_CUDA(cudaFree(d_input_tokens));
     CHECK_CUDA(cudaFree(d_target_tokens));
-    CHECK_CUDA(cudaFree(d_class_labels));
     free_sim(sim);
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
