@@ -30,6 +30,22 @@ void embed_class_in_first_pixel(unsigned char* mnist_images, unsigned char* mnis
     printf("Embedded class information into first pixel of all images\n");
 }
 
+// Shuffle training data in-place
+void shuffle_data(unsigned char* input_tokens, unsigned char* target_tokens, int num_images, int seq_len) {
+    for (int i = num_images - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        for (int k = 0; k < seq_len; k++) {
+            unsigned char temp = input_tokens[i * seq_len + k];
+            input_tokens[i * seq_len + k] = input_tokens[j * seq_len + k];
+            input_tokens[j * seq_len + k] = temp;
+            
+            temp = target_tokens[i * seq_len + k];
+            target_tokens[i * seq_len + k] = target_tokens[j * seq_len + k];
+            target_tokens[j * seq_len + k] = temp;
+        }
+    }
+}
+
 // Generate image function using autoregressive sampling
 void generate_image(SIM* sim, unsigned char* generated_image, float temperature, unsigned char* d_input_tokens, unsigned int seq_len, unsigned char target_class) {
     // Start with black image
@@ -169,6 +185,9 @@ int main(int argc, char* argv[]) {
     // Training loop
     for (int epoch = 0; epoch < num_epochs + 1; epoch++) {
         float epoch_loss = 0.0f;
+        
+        // Shuffle data at the beginning of each epoch
+        shuffle_data(input_tokens, target_tokens, num_images, seq_len);
         
         for (int batch = 0; batch < num_batches; batch++) {
             // Calculate batch offset

@@ -55,7 +55,7 @@ SIM* init_sim(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     CHECK_CUDA(cudaMemset(sim->d_token_embedding_v, 0, token_emb_size * sizeof(float)));
     
     // Initialize transformer
-    sim->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, true, cublaslt_handle);
+    sim->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, true, true, cublaslt_handle);
     
     // Initialize output projection MLP
     sim->output_mlp = init_mlp(d_model, hidden_dim, sim->vocab_size, batch_size * seq_len, cublaslt_handle);
@@ -98,43 +98,6 @@ __global__ static void token_embedding_lookup_kernel(float* embedded, float* tok
     int emb_idx = b * seq_len * d_model + t * d_model + d;
     
     embedded[emb_idx] = token_embedding[token * d_model + d];
-}
-
-// CUDA kernel for 2D positional encodings
-__global__ static void positional_encoding_kernel(float* embedded, int batch_size, int seq_len, int d_model, int image_size) {
-    int b = blockIdx.x;
-    int t = blockIdx.y;
-    int d = threadIdx.x;
-    
-    if (b >= batch_size || t >= seq_len || d >= d_model) return;
-    
-    int idx = b * seq_len * d_model + t * d_model + d;
-    
-    // Convert 1D position to 2D coordinates
-    int row = t / image_size;
-    int col = t % image_size;
-    
-    float encoding = 0.0f;
-    
-    // Split d_model into two parts for row and column encoding
-    if (d < d_model / 2) {
-        // First half: row encoding
-        if (d % 2 == 0) {
-            encoding = sinf(row / powf(10000.0f, (2.0f * (d / 2)) / (d_model / 2)));
-        } else {
-            encoding = cosf(row / powf(10000.0f, (2.0f * ((d - 1) / 2)) / (d_model / 2)));
-        }
-    } else {
-        // Second half: column encoding
-        int d_col = d - d_model / 2;
-        if (d_col % 2 == 0) {
-            encoding = sinf(col / powf(10000.0f, (2.0f * (d_col / 2)) / (d_model / 2)));
-        } else {
-            encoding = cosf(col / powf(10000.0f, (2.0f * ((d_col - 1) / 2)) / (d_model / 2)));
-        }
-    }
-    
-    embedded[idx] += encoding;
 }
 
 __global__ void softmax_cross_entropy_row_kernel(float* loss_out, float* grad_logits, const float* logits, const unsigned char* targets, int rows, int vocab_size) {
@@ -223,15 +186,10 @@ void forward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
         sim->batch_size, sim->seq_len, sim->d_model
     );
     
-    // Step 2: Add 2D positional encodings
-    positional_encoding_kernel<<<grid_emb, block_emb>>>(
-        sim->d_embedded_input, sim->batch_size, sim->seq_len, sim->d_model, (int)sqrt(sim->seq_len)
-    );
-    
-    // Step 3: Forward pass through transformer
+    // Step 2: Forward pass through transformer
     forward_pass_transformer(sim->transformer, sim->d_embedded_input);
     
-    // Step 4: Output projection through MLP
+    // Step 3: Output projection through MLP
     forward_pass_mlp(sim->output_mlp, sim->transformer->mlp_layers[sim->num_layers-1]->d_output);
 }
 
@@ -262,17 +220,14 @@ void zero_gradients_sim(SIM* sim) {
 
 // Backward pass
 void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
-    // Step 4 (backward): Backward pass through output MLP
+    // Step 3 (backward): Backward pass through output MLP
     backward_pass_mlp(sim->output_mlp, 
                       sim->transformer->mlp_layers[sim->num_layers-1]->d_output, 
                       sim->transformer->mlp_layers[sim->num_layers-1]->d_output);
     
-    // Step 3 (backward): Backward pass through transformer
+    // Step 2 (backward): Backward pass through transformer
     backward_pass_transformer(sim->transformer, sim->d_embedded_input, sim->d_embedded_input);
-    
-    // Step 2 (backward): Positional encoding gradients pass through unchanged
-    // (no learnable parameters, gradients flow through to token embeddings)
-    
+
     // Step 1 (backward): Token embedding gradients
     dim3 grid_emb(sim->batch_size, sim->seq_len);
     dim3 block_emb(sim->d_model);
