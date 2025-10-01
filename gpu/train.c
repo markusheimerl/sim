@@ -21,13 +21,19 @@ void handle_sigint(int signum) {
     exit(128 + signum);
 }
 
-// Embed class information into first pixel
+// Embed class information into first pixel (with 10% unconditional)
 void embed_class_in_first_pixel(unsigned char* mnist_images, unsigned char* mnist_labels, int num_images) {
     for (int img = 0; img < num_images; img++) {
         unsigned char class_byte = mnist_labels[img];
+        
+        // 10% chance of using class 10 (unconditional)
+        if ((rand() % 100) < 10) {
+            class_byte = 10;
+        }
+        
         mnist_images[img * 784] = class_byte;
     }
-    printf("Embedded class information into first pixel of all images\n");
+    printf("Embedded class information into first pixel of all images (10%% unconditional)\n");
 }
 
 // Shuffle training data in-place
@@ -46,47 +52,66 @@ void shuffle_data(unsigned char* input_tokens, unsigned char* target_tokens, int
     }
 }
 
-// Generate image function using autoregressive sampling
-void generate_image(SIM* sim, unsigned char* generated_image, float temperature, unsigned char* d_input_tokens, unsigned int seq_len, unsigned char target_class) {
+// Generate image function using autoregressive sampling with classifier-free guidance
+void generate_image_cfg(SIM* sim, unsigned char* generated_image, float temperature, 
+                        float guidance_scale, unsigned char* d_input_tokens, 
+                        unsigned char* d_input_tokens_uncond, unsigned int seq_len, 
+                        unsigned char target_class) {
     // Start with black image
     unsigned char* h_tokens = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
+    unsigned char* h_tokens_uncond = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
     memset(h_tokens, 0, seq_len * sizeof(unsigned char));
+    memset(h_tokens_uncond, 0, seq_len * sizeof(unsigned char));
     
-    // Set first pixel to target class
+    // Set first pixel to target class (conditional)
     h_tokens[0] = target_class;
+    // Set first pixel to class 10 (unconditional)
+    h_tokens_uncond[0] = 10;
     
-    printf("Generating class %d image pixel by pixel...\n", target_class);
+    printf("Generating class %d image with CFG (guidance_scale=%.2f)...\n", target_class, guidance_scale);
     
-    // Allocate logits buffer on host
-    float* h_logits = (float*)malloc(sim->vocab_size * sizeof(float));
+    // Allocate logits buffers on host
+    float* h_logits_cond = (float*)malloc(sim->vocab_size * sizeof(float));
+    float* h_logits_uncond = (float*)malloc(sim->vocab_size * sizeof(float));
+    float* h_logits_final = (float*)malloc(sim->vocab_size * sizeof(float));
     
     // Generate pixels one at a time
     for (int pixel = 0; pixel < (int)(seq_len - 1); pixel++) {
-        // Copy current partial image to device
+        // Copy current partial images to device
         CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_input_tokens_uncond, h_tokens_uncond, seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
 
-        // Forward pass
+        // Forward pass for conditional
         forward_pass_sim(sim, d_input_tokens);
+        CHECK_CUDA(cudaMemcpy(h_logits_cond, &sim->output_mlp->d_output[pixel * sim->vocab_size], 
+                             sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         
-        // Get logits for the current pixel position
-        CHECK_CUDA(cudaMemcpy(h_logits, &sim->output_mlp->d_output[pixel * sim->vocab_size], sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+        // Forward pass for unconditional
+        forward_pass_sim(sim, d_input_tokens_uncond);
+        CHECK_CUDA(cudaMemcpy(h_logits_uncond, &sim->output_mlp->d_output[pixel * sim->vocab_size], 
+                             sim->vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
         
-        // Apply temperature and softmax
+        // Apply classifier-free guidance: final = uncond + guidance_scale * (cond - uncond)
+        for (int v = 0; v < sim->vocab_size; v++) {
+            h_logits_final[v] = h_logits_uncond[v] + guidance_scale * (h_logits_cond[v] - h_logits_uncond[v]);
+        }
+        
+        // Apply temperature and softmax to final logits
         float max_logit = -1e30f;
         for (int v = 0; v < sim->vocab_size; v++) {
-            h_logits[v] /= temperature;
-            if (h_logits[v] > max_logit) max_logit = h_logits[v];
+            h_logits_final[v] /= temperature;
+            if (h_logits_final[v] > max_logit) max_logit = h_logits_final[v];
         }
         
         float sum_exp = 0.0f;
         for (int v = 0; v < sim->vocab_size; v++) {
-            float exp_val = expf(h_logits[v] - max_logit);
-            h_logits[v] = exp_val;
+            float exp_val = expf(h_logits_final[v] - max_logit);
+            h_logits_final[v] = exp_val;
             sum_exp += exp_val;
         }
         
         for (int v = 0; v < sim->vocab_size; v++) {
-            h_logits[v] /= sum_exp;
+            h_logits_final[v] /= sum_exp;
         }
         
         // Sample from the distribution
@@ -94,15 +119,16 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
         unsigned char next_token = 0;
         float cumsum = 0.0f;
         for (int v = 0; v < sim->vocab_size; v++) {
-            cumsum += h_logits[v];
+            cumsum += h_logits_final[v];
             if (r <= cumsum) {
                 next_token = v;
                 break;
             }
         }
         
-        // Set the next pixel
+        // Set the next pixel for both conditional and unconditional
         h_tokens[pixel + 1] = next_token;
+        h_tokens_uncond[pixel + 1] = next_token;
 
         if (pixel % 10 == 0 || pixel == (int)(seq_len - 2)) {
             printf("\rGenerating pixels... %3d%% (%d/%d)", (pixel + 1) * 100 / (seq_len - 1), pixel + 1, seq_len - 1);
@@ -115,7 +141,10 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
     memcpy(generated_image, h_tokens, seq_len * sizeof(unsigned char));
     
     free(h_tokens);
-    free(h_logits);
+    free(h_tokens_uncond);
+    free(h_logits_cond);
+    free(h_logits_uncond);
+    free(h_logits_final);
 }
 
 int main(int argc, char* argv[]) {
@@ -132,6 +161,7 @@ int main(int argc, char* argv[]) {
     const int hidden_dim = 2048;
     const int num_layers = 12;
     const int batch_size = 64;
+    const float guidance_scale = 3.0f;  // CFG guidance scale
     
     // Load MNIST data and embed class information into first pixel
     unsigned char* mnist_images = NULL;
@@ -177,9 +207,10 @@ int main(int argc, char* argv[]) {
     const float learning_rate = 0.00006f;
     const int num_batches = num_images / batch_size;
 
-    // Allocate device memory for batch data
-    unsigned char *d_input_tokens, *d_target_tokens;
+    // Allocate device memory for batch data (need two buffers for CFG)
+    unsigned char *d_input_tokens, *d_input_tokens_uncond, *d_target_tokens;
     CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned char)));
+    CHECK_CUDA(cudaMalloc(&d_input_tokens_uncond, batch_size * seq_len * sizeof(unsigned char)));
     CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned char)));
     
     // Training loop
@@ -228,14 +259,14 @@ int main(int argc, char* argv[]) {
                 unsigned char target_class = (unsigned char)(rand() % 10);
                 
                 unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-                generate_image(sim, generated_image, 0.8f, d_input_tokens, seq_len, target_class);
+                generate_image_cfg(sim, generated_image, 0.8f, guidance_scale, d_input_tokens, d_input_tokens_uncond, seq_len, target_class);
                 
                 // Save generated image with target class
                 char gen_filename[256];
-                snprintf(gen_filename, sizeof(gen_filename), "generated_epoch_%d_batch_%d_class_%d.png", epoch, batch, target_class);
+                snprintf(gen_filename, sizeof(gen_filename), "generated_epoch_%d_batch_%d_class_%d_cfg%.1f.png", epoch, batch, target_class, guidance_scale);
                 save_mnist_image_png(generated_image, gen_filename);
                 
-                printf("Saved generated image (target class %d): %s\n", target_class, gen_filename);
+                printf("Saved generated image (target class %d, CFG=%.1f): %s\n", target_class, guidance_scale, gen_filename);
                 printf("--- End generation ---\n\n");
                 
                 free(generated_image);
@@ -249,15 +280,15 @@ int main(int argc, char* argv[]) {
         
         // Generate sample at end of each epoch for each digit class
         if (epoch < num_epochs) {
-            printf("Generating end-of-epoch samples for each digit...\n");
+            printf("Generating end-of-epoch samples for each digit with CFG...\n");
             for (int digit = 0; digit < 10; digit++) {
                 unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-                generate_image(sim, generated_image, 0.8f, d_input_tokens, seq_len, (unsigned char)digit);
+                generate_image_cfg(sim, generated_image, 0.8f, guidance_scale, d_input_tokens, d_input_tokens_uncond, seq_len, (unsigned char)digit);
                 
                 char gen_filename[256];
-                snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_sample.png", epoch, digit);
+                snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_cfg%.1f_sample.png", epoch, digit, guidance_scale);
                 save_mnist_image_png(generated_image, gen_filename);
-                printf("Saved epoch %d class %d sample: %s\n", epoch, digit, gen_filename);
+                printf("Saved epoch %d class %d sample (CFG=%.1f): %s\n", epoch, digit, guidance_scale, gen_filename);
                 
                 free(generated_image);
             }
@@ -281,6 +312,7 @@ int main(int argc, char* argv[]) {
     free(input_tokens);
     free(target_tokens);
     CHECK_CUDA(cudaFree(d_input_tokens));
+    CHECK_CUDA(cudaFree(d_input_tokens_uncond));
     CHECK_CUDA(cudaFree(d_target_tokens));
     free_sim(sim);
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
