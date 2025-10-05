@@ -115,7 +115,7 @@ int main(int argc, char* argv[]) {
     const int d_model = 512;
     const int hidden_dim = 2048;
     const int num_layers = 12;
-    const int batch_size = 64;
+    const int batch_size = 32;
     
     // Load MNIST data and embed class information into first pixel
     unsigned char* mnist_images = NULL;

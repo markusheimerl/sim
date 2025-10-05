@@ -1,3 +1,6 @@
+run:
+	$(MAKE) -C gpu run
+
 clean:
 	rm -f *.out *.png
 	$(MAKE) -C gpu clean

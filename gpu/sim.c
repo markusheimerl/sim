@@ -137,65 +137,45 @@ __global__ static void positional_encoding_kernel(float* embedded, int batch_siz
     embedded[idx] += encoding;
 }
 
-__global__ void softmax_cross_entropy_row_kernel(float* loss_out, float* grad_logits, const float* logits, const unsigned char* targets, int rows, int vocab_size) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-    int base = row * vocab_size;
-
-    extern __shared__ float shmem[];
-
-    // Row-wise max for numerical stability
-    float thread_max = -1e30f;
-    for (int v = tid; v < vocab_size; v += stride) {
-        float x = logits[base + v];
-        thread_max = fmaxf(thread_max, x);
+// CUDA kernel for softmax and cross-entropy loss computation
+__global__ static void softmax_cross_entropy_kernel(float* loss_result, float* grad_logits, float* logits, unsigned char* targets, int batch_size, int seq_len, int vocab_size) {
+    int b = blockIdx.x;
+    int t = blockIdx.y;
+    
+    if (b >= batch_size || t >= seq_len) return;
+    
+    int logits_offset = b * seq_len * vocab_size + t * vocab_size;
+    float* logits_bt = &logits[logits_offset];
+    float* grad_logits_bt = &grad_logits[logits_offset];
+    
+    // Find max for numerical stability
+    float max_logit = -1e30f;
+    for (int v = 0; v < vocab_size; v++) {
+        if (logits_bt[v] > max_logit) max_logit = logits_bt[v];
     }
-    shmem[tid] = thread_max;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) shmem[tid] = fmaxf(shmem[tid], shmem[tid + s]);
-        __syncthreads();
+    
+    // Compute softmax probabilities
+    float sum_exp = 0.0f;
+    for (int v = 0; v < vocab_size; v++) {
+        float exp_val = expf(logits_bt[v] - max_logit);
+        grad_logits_bt[v] = exp_val;
+        sum_exp += exp_val;
     }
-    float row_max = shmem[0];
-    __syncthreads();
-
-    // Row-wise sum of exp(logit - row_max), and stash exp in grad_logits
-    float thread_sum = 0.0f;
-    for (int v = tid; v < vocab_size; v += stride) {
-        float e = __expf(logits[base + v] - row_max);
-        grad_logits[base + v] = e;
-        thread_sum += e;
+    
+    // Normalize to get probabilities
+    for (int v = 0; v < vocab_size; v++) {
+        grad_logits_bt[v] /= sum_exp;
     }
-    shmem[tid] = thread_sum;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) shmem[tid] += shmem[tid + s];
-        __syncthreads();
-    }
-    float row_sum = shmem[0];
-    __syncthreads();
-
-    // Normalize to probabilities and write gradient p - one_hot
-    int t = targets[row];
-    __shared__ float p_target;
-    if (tid == 0) p_target = 0.0f;
-    __syncthreads();
-
-    for (int v = tid; v < vocab_size; v += stride) {
-        float p = grad_logits[base + v] / row_sum;
-        grad_logits[base + v] = p - (v == t ? 1.0f : 0.0f);
-        if (v == t) p_target = p;
-    }
-    __syncthreads();
-
-    // Accumulate the loss for this row: -log p(target)
-    if (tid == 0) {
-        float loss_row = -logf(fmaxf(p_target, 1e-30f));
-        atomicAdd(loss_out, loss_row);
-    }
+    
+    // Compute cross-entropy loss and gradient
+    int target_token = targets[b * seq_len + t];
+    float target_prob = grad_logits_bt[target_token];
+    
+    // Add cross-entropy loss
+    atomicAdd(loss_result, -logf(target_prob + 1e-10f));
+    
+    // Set gradient: softmax - one_hot
+    grad_logits_bt[target_token] -= 1.0f;
 }
 
 // CUDA kernel for token embedding gradient accumulation
@@ -241,9 +221,13 @@ float calculate_loss_sim(SIM* sim, unsigned char* d_target_tokens) {
     CHECK_CUDA(cudaMemset(sim->d_loss_result, 0, sizeof(float)));
     
     // Compute softmax and cross-entropy loss
-    softmax_cross_entropy_row_kernel<<<sim->batch_size * sim->seq_len, 256, 256 * sizeof(float)>>>(sim->d_loss_result, 
-        sim->output_mlp->d_output, sim->output_mlp->d_output, d_target_tokens, sim->batch_size * sim->seq_len, sim->vocab_size);
-
+    dim3 grid(sim->batch_size, sim->seq_len);
+    softmax_cross_entropy_kernel<<<grid, 1>>>(
+        sim->d_loss_result, sim->output_mlp->d_grad_output, sim->output_mlp->d_output, d_target_tokens,
+        sim->batch_size, sim->seq_len, sim->vocab_size
+    );
+    
+    // Copy result back to host
     float total_loss;
     CHECK_CUDA(cudaMemcpy(&total_loss, sim->d_loss_result, sizeof(float), cudaMemcpyDeviceToHost));
     
@@ -265,7 +249,7 @@ void backward_pass_sim(SIM* sim, unsigned char* d_input_tokens) {
     // Step 4 (backward): Backward pass through output MLP
     backward_pass_mlp(sim->output_mlp, 
                       sim->transformer->mlp_layers[sim->num_layers-1]->d_output, 
-                      sim->transformer->mlp_layers[sim->num_layers-1]->d_output);
+                      sim->transformer->mlp_layers[sim->num_layers-1]->d_grad_output);
     
     // Step 3 (backward): Backward pass through transformer
     backward_pass_transformer(sim->transformer, sim->d_embedded_input, sim->d_embedded_input);
