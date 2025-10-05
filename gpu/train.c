@@ -33,8 +33,7 @@ void embed_class_in_first_pixel(unsigned char* mnist_images, unsigned char* mnis
 // Generate image function using autoregressive sampling
 void generate_image(SIM* sim, unsigned char* generated_image, float temperature, unsigned char* d_input_tokens, unsigned int seq_len, unsigned char target_class) {
     // Start with black image
-    unsigned char* h_tokens = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-    memset(h_tokens, 0, seq_len * sizeof(unsigned char));
+    unsigned char* h_tokens = (unsigned char*)calloc(seq_len, sizeof(unsigned char));
     
     // Set first pixel to target class
     h_tokens[0] = target_class;
@@ -132,17 +131,6 @@ int main(int argc, char* argv[]) {
     for (int img = 0; img < num_images; img++) {
         memcpy(&input_tokens[img * seq_len], &mnist_images[img * seq_len], seq_len * sizeof(unsigned char));
         memcpy(&target_tokens[img * seq_len], &input_tokens[img * seq_len] + 1, (seq_len - 1) * sizeof(unsigned char));
-    }
-    
-    // Save some sample images to verify preprocessing
-    printf("Saving sample images to verify class embedding...\n");
-    for (int i = 0; i < 10; i++) {
-        unsigned char extracted_class = input_tokens[i * seq_len];
-        
-        char sample_filename[256];
-        snprintf(sample_filename, sizeof(sample_filename), "sample_embedded_class_%d_idx_%d.png", extracted_class, i);
-        save_mnist_image_png(&mnist_images[i * seq_len], sample_filename);
-        printf("Saved sample %d: embedded_class=%d, file=%s\n", i, extracted_class, sample_filename);
     }
     
     // Initialize or load SIM
