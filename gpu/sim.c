@@ -112,7 +112,6 @@ __global__ static void positional_encoding_kernel(float* embedded, int batch_siz
     
     // For RGB images: seq_len = image_size * image_size * 3
     // Convert 1D position to 2D coordinates + channel
-    int pixels_per_image = image_size * image_size;
     int pixel_idx = t / 3;  // Which spatial pixel (0 to 1023 for 32x32)
     int channel = t % 3;     // Which channel (0=R, 1=G, 2=B)
     
