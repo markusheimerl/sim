@@ -100,7 +100,7 @@ __global__ static void token_embedding_lookup_kernel(float* embedded, float* tok
     embedded[emb_idx] = token_embedding[token * d_model + d];
 }
 
-// CUDA kernel for 2D positional encodings
+// CUDA kernel for 2D positional encodings with channel awareness
 __global__ static void positional_encoding_kernel(float* embedded, int batch_size, int seq_len, int d_model, int image_size) {
     int b = blockIdx.x;
     int t = blockIdx.y;
@@ -110,27 +110,42 @@ __global__ static void positional_encoding_kernel(float* embedded, int batch_siz
     
     int idx = b * seq_len * d_model + t * d_model + d;
     
-    // Convert 1D position to 2D coordinates
-    int row = t / image_size;
-    int col = t % image_size;
+    // For RGB images: seq_len = image_size * image_size * 3
+    // Convert 1D position to 2D coordinates + channel
+    int pixels_per_image = image_size * image_size;
+    int pixel_idx = t / 3;  // Which spatial pixel (0 to 1023 for 32x32)
+    int channel = t % 3;     // Which channel (0=R, 1=G, 2=B)
+    
+    int row = pixel_idx / image_size;
+    int col = pixel_idx % image_size;
     
     float encoding = 0.0f;
     
-    // Split d_model into two parts for row and column encoding
-    if (d < d_model / 2) {
-        // First half: row encoding
+    // Split d_model into three parts for row, column, and channel encoding
+    int third = d_model / 3;
+    
+    if (d < third) {
+        // First third: row encoding
         if (d % 2 == 0) {
-            encoding = sinf(row / powf(10000.0f, (2.0f * (d / 2)) / (d_model / 2)));
+            encoding = sinf(row / powf(10000.0f, (2.0f * (d / 2)) / third));
         } else {
-            encoding = cosf(row / powf(10000.0f, (2.0f * ((d - 1) / 2)) / (d_model / 2)));
+            encoding = cosf(row / powf(10000.0f, (2.0f * ((d - 1) / 2)) / third));
+        }
+    } else if (d < 2 * third) {
+        // Second third: column encoding
+        int d_col = d - third;
+        if (d_col % 2 == 0) {
+            encoding = sinf(col / powf(10000.0f, (2.0f * (d_col / 2)) / third));
+        } else {
+            encoding = cosf(col / powf(10000.0f, (2.0f * ((d_col - 1) / 2)) / third));
         }
     } else {
-        // Second half: column encoding
-        int d_col = d - d_model / 2;
-        if (d_col % 2 == 0) {
-            encoding = sinf(col / powf(10000.0f, (2.0f * (d_col / 2)) / (d_model / 2)));
+        // Last third: channel encoding
+        int d_chan = d - 2 * third;
+        if (d_chan % 2 == 0) {
+            encoding = sinf(channel / powf(10000.0f, (2.0f * (d_chan / 2)) / third));
         } else {
-            encoding = cosf(col / powf(10000.0f, (2.0f * ((d_col - 1) / 2)) / (d_model / 2)));
+            encoding = cosf(channel / powf(10000.0f, (2.0f * ((d_chan - 1) / 2)) / third));
         }
     }
     

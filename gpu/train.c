@@ -21,13 +21,16 @@ void handle_sigint(int signum) {
     exit(128 + signum);
 }
 
-// Embed class information into first pixel
-void embed_class_in_first_pixel(unsigned char* mnist_images, unsigned char* mnist_labels, int num_images) {
+// Embed class information into first RGB triple
+void embed_class_in_first_pixel(unsigned char* cifar_images, unsigned char* cifar_labels, int num_images) {
     for (int img = 0; img < num_images; img++) {
-        unsigned char class_byte = mnist_labels[img];
-        mnist_images[img * 784] = class_byte;
+        unsigned char class_byte = cifar_labels[img];
+        // Embed class in first RGB triple
+        cifar_images[img * 3072 + 0] = class_byte;
+        cifar_images[img * 3072 + 1] = class_byte;
+        cifar_images[img * 3072 + 2] = class_byte;
     }
-    printf("Embedded class information into first pixel of all images\n");
+    printf("Embedded class information into first RGB triple of all images\n");
 }
 
 // Generate image function using autoregressive sampling
@@ -35,8 +38,10 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
     // Start with black image
     unsigned char* h_tokens = (unsigned char*)calloc(seq_len, sizeof(unsigned char));
     
-    // Set first pixel to target class
+    // Set first RGB triple to target class
     h_tokens[0] = target_class;
+    h_tokens[1] = target_class;
+    h_tokens[2] = target_class;
     
     printf("Generating class %d image pixel by pixel...\n", target_class);
     
@@ -87,7 +92,7 @@ void generate_image(SIM* sim, unsigned char* generated_image, float temperature,
         // Set the next pixel
         h_tokens[pixel + 1] = next_token;
 
-        if (pixel % 10 == 0 || pixel == (int)(seq_len - 2)) {
+        if (pixel % 100 == 0 || pixel == (int)(seq_len - 2)) {
             printf("\rGenerating pixels... %3d%% (%d/%d)", (pixel + 1) * 100 / (seq_len - 1), pixel + 1, seq_len - 1);
             fflush(stdout);
         }
@@ -109,27 +114,35 @@ int main(int argc, char* argv[]) {
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
 
-    // Parameters
-    const int seq_len = 28 * 28;
+    // Parameters for CIFAR-10 (32x32 RGB)
+    const int seq_len = 32 * 32 * 3;  // 3072 tokens
     const int d_model = 512;
     const int hidden_dim = 2048;
     const int num_layers = 12;
-    const int batch_size = 32;
+    const int batch_size = 6;
     
-    // Load MNIST data and embed class information into first pixel
-    unsigned char* mnist_images = NULL;
-    unsigned char* mnist_labels = NULL;
-    int num_images, num_labels = 0;
-    load_mnist_data(&mnist_images, &num_images, "../train-images-idx3-ubyte");
-    load_mnist_labels(&mnist_labels, &num_labels, "../train-labels-idx1-ubyte");
-    embed_class_in_first_pixel(mnist_images, mnist_labels, num_images);
+    // Load CIFAR-10 data
+    unsigned char* cifar_images = NULL;
+    unsigned char* cifar_labels = NULL;
+    int num_images = 0;
+    
+    const char* batch_files[] = {
+        "../cifar-10-batches-bin/data_batch_1.bin",
+        "../cifar-10-batches-bin/data_batch_2.bin",
+        "../cifar-10-batches-bin/data_batch_3.bin",
+        "../cifar-10-batches-bin/data_batch_4.bin",
+        "../cifar-10-batches-bin/data_batch_5.bin"
+    };
+    
+    load_cifar10_data(&cifar_images, &cifar_labels, &num_images, batch_files, 5);
+    embed_class_in_first_pixel(cifar_images, cifar_labels, num_images);
     
     // Create token sequences
     unsigned char* input_tokens = (unsigned char*)calloc(num_images * seq_len, sizeof(unsigned char));
     unsigned char* target_tokens = (unsigned char*)calloc(num_images * seq_len, sizeof(unsigned char));
     
     for (int img = 0; img < num_images; img++) {
-        memcpy(&input_tokens[img * seq_len], &mnist_images[img * seq_len], seq_len * sizeof(unsigned char));
+        memcpy(&input_tokens[img * seq_len], &cifar_images[img * seq_len], seq_len * sizeof(unsigned char));
         memcpy(&target_tokens[img * seq_len], &input_tokens[img * seq_len] + 1, (seq_len - 1) * sizeof(unsigned char));
     }
     
@@ -146,7 +159,7 @@ int main(int argc, char* argv[]) {
     
     // Training parameters
     const int num_epochs = 200;
-    const float learning_rate = 0.00007f;
+    const float learning_rate = 0.00005f;  // Slightly lower for larger images
     const int num_batches = num_images / batch_size;
 
     // Allocate device memory for batch data
@@ -202,7 +215,7 @@ int main(int argc, char* argv[]) {
                 // Save generated image with target class
                 char gen_filename[256];
                 snprintf(gen_filename, sizeof(gen_filename), "generated_epoch_%d_batch_%d_class_%d.png", epoch, batch, target_class);
-                save_mnist_image_png(generated_image, gen_filename);
+                save_cifar10_image_png(generated_image, gen_filename);
                 
                 printf("Saved generated image (target class %d): %s\n", target_class, gen_filename);
                 printf("--- End generation ---\n\n");
@@ -216,17 +229,19 @@ int main(int argc, char* argv[]) {
         // Print epoch summary
         printf("Epoch [%d/%d] completed, Average Loss: %.6f\n", epoch, num_epochs, epoch_loss);
         
-        // Generate sample at end of each epoch for each digit class
+        // Generate sample at end of each epoch for each class
         if (epoch < num_epochs) {
-            printf("Generating end-of-epoch samples for each digit...\n");
-            for (int digit = 0; digit < 10; digit++) {
+            printf("Generating end-of-epoch samples for each class...\n");
+            const char* class_names[] = {"airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"};
+            
+            for (int class_idx = 0; class_idx < 10; class_idx++) {
                 unsigned char* generated_image = (unsigned char*)malloc(seq_len * sizeof(unsigned char));
-                generate_image(sim, generated_image, 0.8f, d_input_tokens, seq_len, (unsigned char)digit);
+                generate_image(sim, generated_image, 0.8f, d_input_tokens, seq_len, (unsigned char)class_idx);
                 
                 char gen_filename[256];
-                snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_sample.png", epoch, digit);
-                save_mnist_image_png(generated_image, gen_filename);
-                printf("Saved epoch %d class %d sample: %s\n", epoch, digit, gen_filename);
+                snprintf(gen_filename, sizeof(gen_filename), "epoch_%d_class_%d_%s_sample.png", epoch, class_idx, class_names[class_idx]);
+                save_cifar10_image_png(generated_image, gen_filename);
+                printf("Saved epoch %d class %d (%s) sample: %s\n", epoch, class_idx, class_names[class_idx], gen_filename);
                 
                 free(generated_image);
             }
@@ -245,8 +260,8 @@ int main(int argc, char* argv[]) {
     save_sim(sim, model_fname);
     
     // Cleanup
-    free(mnist_images);
-    free(mnist_labels);
+    free(cifar_images);
+    free(cifar_labels);
     free(input_tokens);
     free(target_tokens);
     CHECK_CUDA(cudaFree(d_input_tokens));
